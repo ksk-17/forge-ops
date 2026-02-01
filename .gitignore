@@ -1,0 +1,10 @@
+__pycache__/
+.deepeval/
+.venv/
+
+.env
+
+dev_files/
+outputs/
+
+commands.txt
