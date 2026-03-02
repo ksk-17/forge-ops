@@ -1,4 +1,6 @@
 langchain
 langchain-openai
 langgraph
+zod # for langsmith
 python-dotenv
+pytest

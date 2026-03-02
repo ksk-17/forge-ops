@@ -4,6 +4,7 @@ from typing import Dict, Tuple, Optional
 import threading
 import uuid
 import time
+from FileEditor import NEW_FILE_PLACEHOLDER
 
 PROJECTS_PATH = Path("projects")
 
@@ -19,7 +20,7 @@ class FileManager:
         self.base_path = base_path
         self.locks: Dict[Tuple[str, str], LockInfo] = {}
         self.mu = threading.Lock()
-        self.base_path.mkdir(parent=True, exist_ok=True)
+        self.base_path.mkdir(parents=True, exist_ok=True)
 
     def create_project(self) -> str:
         project_id = str(uuid.uuid4())
@@ -30,7 +31,9 @@ class FileManager:
     def create_file(self, project_id: str, file_path: str):
         p = self.abs_path(project_id, file_path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.touch(exist_ok=True)
+        # Create file with placeholder content for agent to work with
+        if not p.exists():
+            p.write_text(NEW_FILE_PLACEHOLDER)
         return p 
 
     def check_lock(self, project_id: str, file_path: str) -> Optional[str]:
@@ -52,7 +55,7 @@ class FileManager:
 
     def release_lock(self, project_id: str, file_path: str, worker_id: str) -> bool:
         key = self.lock_key(project_id, file_path)
-        with self.mu():
+        with self.mu:
             info = self.locks.get(key)
             if not info:
                 return True
@@ -64,7 +67,7 @@ class FileManager:
     def renew_lock(self, project_id: str, file_path: str, worker_id: str, ttl_seconds: int = 300) -> bool:
         key = self.lock_key(project_id, file_path)
         now = time.time()
-        with self.mu():
+        with self.mu:
             info = self.locks.get(key)
             if not info or info.worker_id != worker_id:
                 return False
@@ -90,5 +93,5 @@ class FileManager:
         info = self.locks.get(key)
         if not info:
             return
-        if time.time() - info.acquired_at() > info.ttl_seconds:
+        if time.time() - info.acquired_at > info.ttl_seconds:
             del self.locks[key]
