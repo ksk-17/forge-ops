@@ -1,10 +1,12 @@
 __pycache__/
 .deepeval/
 .venv/
+.pytest_cache/
 
 .env
 
 dev_files/
 outputs/
+projects/
 
 commands.txt

@@ -1,36 +1,19 @@
-from dataclasses import dataclass
-from typing import Literal, Optional
-from pydantic import BaseModel
-
-Ops = Literal["insert_after", "insert_before", "replace", "delete"]
+from dataclasses import dataclass, field
+from typing import Literal, List, Dict, Optional
 
 @dataclass
-class Edit(BaseModel):
-    op: Ops
-    identifier: str
-    value: str
-    occurence: Optional[int] = None
+class Edit:
+    operation: Literal["insert", "update", "delete"]
+    start_line: int
+    end_line: int | None
+    new_value: str = ""
+    method_description_changes: Dict[str, str] = field(default_factory=dict)
 
-TASK_STATUS = Literal["Not Assigned", "Assigned", "In Progress", "Pending Review", "Done"]
-
-class Task(BaseModel):
+@dataclass
+class Task:
     task_id: str
+    project_id: str
     desc: str
-    status: TASK_STATUS
+    status: Literal["Open", "InProgress", "PendingReview", "ReworkRequired", "Closed"]
     worker_id: str
-
-class ReviewClass(BaseModel):
-    satisfied: bool
-    comments: str
-
-# helper function to render the class
-def render_task(task: Task):
-    return(
-        f"Description:\n{task.desc}"
-    )
-
-def render_review(review: ReviewClass) -> str:
-    return (
-        f"Review Satisfied:\n{review.satisfied}\n\n"
-        f"Comments:\n{review.comments}"
-    )
+    dependency_list: List[str]
