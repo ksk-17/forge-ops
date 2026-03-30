@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Literal, List, Dict, Optional
+from typing import Literal, List, Dict, Optional, TypedDict
 
 @dataclass
 class Edit:
@@ -36,3 +36,17 @@ class Task:
             raise ValueError("task_id cannot be empty")
         if not self.project_id:
             raise ValueError("project_id cannot be empty")
+        
+class WorkerReport(TypedDict):
+    task_id: str
+    worker_id: str
+    status: Literal["completed", "completed_with_issues", "blocked", "failed"]
+    summary: str
+    touched_files: List[str]
+    test_file_path: Optional[str]
+    review_score: int
+    review_feedback: str
+    blockers: List[str]
+    suggestions: List[str]
+    execution_notes: str
+    completed_at: str 
