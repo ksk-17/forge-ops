@@ -4,3 +4,4 @@ langgraph
 zod # for langsmith
 python-dotenv
 pytest
+portalocker # for fcntl
