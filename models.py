@@ -50,3 +50,34 @@ class WorkerReport(TypedDict):
     suggestions: List[str]
     execution_notes: str
     completed_at: str 
+
+class TaskRecord(TypedDict):
+    task_id: str
+    project_id: str
+    desc: str
+    status: Literal["Open", "InProgress", "PendingReview", "ReworkRequired", "Closed"]
+    worker_id: str
+    dependency_list: List[str]
+    retry_count: int
+    report: Optional[Dict]
+    review_notes: str  
+
+class BatchReview(TypedDict):
+    """Result of reviewing a completed batch of tasks together."""
+    score: int
+    verdict: Literal["pass", "fail"]
+    issues: List[str]
+    suggestions: List[str]
+    summary: str
+
+class ProjectReport(TypedDict):
+    project_id: str
+    total_tasks: int
+    completed_tasks: int
+    failed_tasks: int
+    blocked_tasks: int
+    all_touched_files: List[str]
+    batch_review_scores: List[int]
+    final_status: Literal["success", "partial", "failed"]
+    summary: str
+    completed_at: str
