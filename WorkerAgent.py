@@ -21,7 +21,7 @@ from WorkerTools import (
 
 logger = logging.getLogger(__name__)
 
-MODEL = "claude-opus-4-5"
+MODEL = "claude-haiku-4-5"
 MAX_REWORK_CYCLES = 2
 MAX_TOOL_ITERATIONS = 20
 REVIEW_PASS_THRESHOLD = 7
