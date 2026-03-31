@@ -271,11 +271,16 @@ class TestRunToolLoop:
 
     def test_tool_results_are_injected_as_user_turn(self):
         """
-        After a tool_use response, the next messages.create call must receive
-        a user turn whose content is a list of tool_result dicts.
+        After a tool_use response the loop must inject a user turn carrying the
+        tool_result before making the next API call.
 
-        _run_tool_loop calls client.messages.create(..., messages=messages) using
-        keyword arguments, so mock stores them in call.kwargs, not call.args.
+        Message order on the 2nd API call:
+          [0] assistant  serialized tool_use block from turn 1
+          [1] user       tool_result turn (what we are testing)
+          [2] assistant  serialized text from turn 2 (appended before stop_reason
+                         check fires, so it appears in the list too)
+
+        We search for the tool_result user turn rather than relying on position.
         """
         tool_resp = _tool_response("id-1", "get_project_schema", {"project_id": "p"})
         done_resp = _text_response("Done.")
@@ -285,17 +290,22 @@ class TestRunToolLoop:
         with patch.object(wa, "_dispatch_tool", return_value='{"schema": "x"}'):
             _run_tool_loop(client, "sys", [])
 
-        # _run_tool_loop calls create(..., messages=messages) — all keyword args.
-        # mock stores these in call.kwargs, accessible directly.
         second_call = client.messages.create.call_args_list[1]
         second_call_messages = second_call.kwargs["messages"]
 
-        # The last entry must be the tool_result user turn injected after turn 1.
-        last_turn = second_call_messages[-1]
-        assert last_turn["role"] == "user"
-        assert isinstance(last_turn["content"], list)
-        assert last_turn["content"][0]["type"] == "tool_result"
-        assert last_turn["content"][0]["tool_use_id"] == "id-1"
+        # Find the user turn that carries tool_result content
+        tool_result_turns = [
+            m for m in second_call_messages
+            if m["role"] == "user"
+            and isinstance(m.get("content"), list)
+            and any(c.get("type") == "tool_result" for c in m["content"])
+        ]
+        assert len(tool_result_turns) == 1, (
+            f"Expected 1 tool_result user turn, found {len(tool_result_turns)}"
+        )
+        tool_turn = tool_result_turns[0]
+        assert tool_turn["content"][0]["type"] == "tool_result"
+        assert tool_turn["content"][0]["tool_use_id"] == "id-1"
 
 class TestShouldRework:
     def _state(self, score: int, rework_count: int) -> dict:
@@ -382,9 +392,18 @@ class TestExecuteTask:
         assert result["execution_notes"] == expected_notes
         assert mock_loop.call_count == 1
 
-    def test_passes_existing_messages_to_loop(self, base_state):
-        prior_messages = [{"role": "user", "content": "prior msg"}]
-        base_state["messages"] = prior_messages
+    def test_starts_with_fresh_message_list(self, base_state):
+        """
+        execute_task must NOT forward state["messages"] to _run_tool_loop.
+
+        LangGraph converts plain message dicts in state into its own message
+        objects (HumanMessage / AIMessage) which the Anthropic API rejects with
+        a 400 "messages.0.role: Field required" error. execute_task therefore
+        always starts a fresh single-user-message list so only plain dicts reach
+        the API, regardless of what is stored in state["messages"].
+        """
+        # Even with prior messages in state, execute_task must ignore them.
+        base_state["messages"] = [{"role": "user", "content": "prior msg that must be ignored"}]
 
         captured_initial = []
         def fake_loop(client, system, initial_messages, **kw):
@@ -395,8 +414,13 @@ class TestExecuteTask:
              patch.object(wa, "_run_tool_loop", side_effect=fake_loop):
             execute_task(base_state)
 
-        # Prior message should be at the start of initial_messages
-        assert captured_initial[0] == prior_messages[0]
+        # Must be exactly 1 message — the fresh task-execution prompt.
+        # The prior state message must NOT be present.
+        assert len(captured_initial) == 1, (
+            f"Expected 1 initial message, got {len(captured_initial)}: {captured_initial}"
+        )
+        assert captured_initial[0]["role"] == "user"
+        assert "prior msg" not in captured_initial[0]["content"]
 
     def test_plan_injected_into_system_prompt(self, base_state):
         base_state["plan"] = "UNIQUE_PLAN_CONTENT_XYZ"
