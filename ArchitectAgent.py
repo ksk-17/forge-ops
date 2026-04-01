@@ -607,17 +607,27 @@ def _read_line(prompt: str = "") -> str:
 def _collect_question_answers(n_questions: int) -> str:
     _drain_stdin()
     lines = []
+    consecutive_empty = 0
     while True:
         line = _read_line()
-        if line == "" and lines:    # blank line after answers → submit
-            break
+
         if line == "":
-            continue                # leading blank → ignore
+            consecutive_empty += 1
+            if lines:
+                # Blank line after at least one answer → user submitted
+                break
+            if consecutive_empty >= 3:
+                # Three consecutive empty reads = EOF (StringIO exhausted
+                # or piped input ended) — stop to avoid infinite loop
+                break
+            continue   # leading blank or single stray blank → skip
+
+        consecutive_empty = 0
         lines.append(line)
         if len(lines) >= n_questions:
-            # Drain the terminating blank line the user typed
             _drain_stdin()
             break
+
     return "\n".join(lines)
 
 

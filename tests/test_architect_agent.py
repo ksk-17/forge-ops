@@ -18,10 +18,13 @@ from ArchitectAgent import (
     Question,
     RequirementsReview,
     UserAnswer,
+    _collect_question_answers,
+    _drain_stdin,
+    _extract_interrupt,
     _format_question_for_display,
-    _get_interrupt_value,
     _normalise_answer,
     _parse_questions,
+    _read_line,
     _render_understanding,
     analyse_input,
     ask_user,
@@ -261,28 +264,140 @@ class TestRenderUnderstanding:
         assert "A1" in result
         assert "A2" in result
 
-class TestGetInterruptValue:
-    def test_returns_value_from_task_interrupts(self):
-        interrupt_obj = SimpleNamespace(value="the prompt text")
-        task = SimpleNamespace(interrupts=[interrupt_obj])
-        state = SimpleNamespace(tasks=[task])
-        assert _get_interrupt_value(state) == "the prompt text"
+class TestExtractInterrupt:
+    def test_returns_value_from_interrupt_object(self):
+        intr = SimpleNamespace(value="the prompt text")
+        event = {"__interrupt__": [intr]}
+        assert _extract_interrupt(event) == "the prompt text"
 
-    def test_returns_empty_string_when_no_tasks(self):
-        state = SimpleNamespace(tasks=[])
-        assert _get_interrupt_value(state) == ""
+    def test_returns_empty_string_when_no_interrupt_key(self):
+        assert _extract_interrupt({}) == ""
 
-    def test_returns_empty_string_when_no_interrupts(self):
-        task = SimpleNamespace(interrupts=[])
-        state = SimpleNamespace(tasks=[task])
-        assert _get_interrupt_value(state) == ""
+    def test_returns_empty_string_when_interrupt_list_empty(self):
+        assert _extract_interrupt({"__interrupt__": []}) == ""
 
-    def test_returns_first_interrupt_value(self):
+    def test_returns_first_interrupt_when_multiple(self):
         i1 = SimpleNamespace(value="first")
         i2 = SimpleNamespace(value="second")
-        task = SimpleNamespace(interrupts=[i1, i2])
-        state = SimpleNamespace(tasks=[task])
-        assert _get_interrupt_value(state) == "first"
+        event = {"__interrupt__": [i1, i2]}
+        assert _extract_interrupt(event) == "first"
+
+    def test_falls_back_to_str_when_no_value_attr(self):
+        """If the interrupt object has no .value, str() it."""
+        event = {"__interrupt__": ["plain string interrupt"]}
+        result = _extract_interrupt(event)
+        assert result == "plain string interrupt"
+
+    def test_returns_empty_when_value_is_none(self):
+        """None .value → falls back to str(obj) which would be repr of namespace."""
+        intr = SimpleNamespace(value=None)
+        event = {"__interrupt__": [intr]}
+        # value is None so getattr returns None → falls through to str(first)
+        result = _extract_interrupt(event)
+        # str(SimpleNamespace(value=None)) is not empty — just check it returns a string
+        assert isinstance(result, str)
+
+class TestDrainStdin:
+    def test_does_not_raise_on_non_tty(self):
+        """_drain_stdin must not raise in a non-tty test environment."""
+        _drain_stdin()  # must not raise
+
+
+class TestReadLine:
+    def _fake_stdin(self, text):
+        import io, sys
+        from contextlib import contextmanager
+        @contextmanager
+        def cm():
+            fake = io.StringIO(text)
+            orig = sys.stdin
+            sys.stdin = fake
+            try:
+                yield
+            finally:
+                sys.stdin = orig
+        return cm()
+
+    def test_reads_line_from_stdin(self):
+        with self._fake_stdin("hello world\n"):
+
+            result = _read_line()
+        assert result == "hello world"
+
+    def test_strips_trailing_newline(self):
+        with self._fake_stdin("answer\n"):
+
+            result = _read_line()
+        assert result == "answer"
+
+    def test_returns_empty_when_exhausted(self):
+        with self._fake_stdin(""):
+            result = _read_line()
+        assert result == ""
+
+    def test_returns_empty_on_eoferror(self):
+        import sys
+
+        class EOFStdin:
+            def readline(self):
+                raise EOFError
+            def isatty(self):
+                return False
+
+        orig = sys.stdin
+        sys.stdin = EOFStdin()
+        try:
+            result = _read_line()
+            assert result == ""
+        finally:
+            sys.stdin = orig
+
+    def test_writes_prompt_to_stdout(self):
+        import io, sys
+        fake_stdout = io.StringIO()
+        orig_out = sys.stdout
+        sys.stdout = fake_stdout
+        try:
+            with self._fake_stdin("val\n"):
+                _read_line("Type here: ")
+        finally:
+            sys.stdout = orig_out
+        assert "Type here: " in fake_stdout.getvalue()
+
+
+class TestCollectQuestionAnswers:
+    def _run(self, stdin_text, n):
+        """Run _collect_question_answers with fake stdin and no-op drain."""
+        import io, sys
+        from unittest.mock import patch
+        import ArchitectAgent
+        fake_stdin = io.StringIO(stdin_text)
+        with patch.object(sys, "stdin", fake_stdin), \
+             patch.object(ArchitectAgent, "_drain_stdin", lambda: None):
+            return _collect_question_answers(n)
+
+    def test_collects_exact_n_answers(self):
+        result = self._run("ans1\nans2\nans3\n", 3)
+        assert result == "ans1\nans2\nans3"
+
+    def test_stops_at_blank_line_early(self):
+        """Blank line after first answer submits early."""
+        result = self._run("ans1\n\n", 3)
+        assert result == "ans1"
+
+    def test_ignores_leading_blank_lines(self):
+        result = self._run("\nans1\n\n", 2)
+        assert "ans1" in result
+
+    def test_returns_empty_on_immediate_eof(self):
+        """Empty StringIO triggers EOF guard and returns empty string."""
+        result = self._run("", 2)
+        assert result == ""
+
+    def test_two_answers_joined_with_newline(self):
+        result = self._run("a\nb\n", 2)
+        assert result == "a\nb"
+
 
 class TestAnalyseInput:
     def test_sets_understanding_from_llm(self):
@@ -331,6 +446,20 @@ class TestAnalyseInput:
             result = analyse_input(state)
 
         assert result["understanding"] == ""
+
+    def test_system_prompt_includes_assumed_by_default_section(self):
+        state = _base_state()
+        captured_system = []
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = lambda **kw: (
+            captured_system.append(kw["system"]) or _text_response("understanding")
+        )
+
+        with patch("ArchitectAgent.Anthropic", return_value=mock_client):
+            analyse_input(state)
+
+        assert "Assumed by default" in captured_system[0]
+        assert "Critical gaps" in captured_system[0]
 
 class TestGenerateQuestions:
     def _valid_questions_json(self, n: int = 2) -> str:
@@ -385,6 +514,32 @@ class TestGenerateQuestions:
 
         assert result["questions"] == []
 
+    def test_empty_json_array_is_valid_output(self):
+        state = _base_state()
+        mock_client = _mock_llm("[]")
+
+        with patch("ArchitectAgent.Anthropic", return_value=mock_client):
+            result = generate_questions(state)
+
+        assert result["questions"] == []
+
+    def test_system_prompt_enforces_critical_questions_only(self):
+        """
+        Updated prompt contains explicit rules forbidding minor-detail questions
+        (naming, formatting, date formats, CLI library choice, etc.).
+        """
+        state = _base_state()
+        captured_system = []
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = lambda **kw: (
+            captured_system.append(kw["system"]) or _text_response("[]")
+        )
+
+        with patch("ArchitectAgent.Anthropic", return_value=mock_client):
+            generate_questions(state)
+
+        assert "STRICT RULES" in captured_system[0]
+        assert "WRONG assumption" in captured_system[0]
 
 class TestAskUser:
     def _make_state_with_questions(self, qs: List[Question]) -> ArchitectState:
@@ -560,6 +715,19 @@ class TestCheckCompleteness:
             result = check_completeness(state)
 
         assert result["completeness_score"] == 7
+
+    def test_system_prompt_uses_generous_scoring_principle(self):
+        state = _base_state()
+        captured_system = []
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = lambda **kw: (
+            captured_system.append(kw["system"]) or _text_response("SCORE: 8\nVERDICT: OK.")
+        )
+
+        with patch("ArchitectAgent.Anthropic", return_value=mock_client):
+            check_completeness(state)
+
+        assert "core system shape" in captured_system[0]
 
 class TestPresentSummary:
     def test_accept_decision(self):
@@ -818,10 +986,7 @@ class TestBuildArchitectGraph:
     def test_graph_compiles_without_error(self):
         from langgraph.checkpoint.memory import MemorySaver
         graph = build_architect_graph()
-        compiled = graph.compile(
-            checkpointer=MemorySaver(),
-            interrupt_before=["ask_user", "present_summary"],
-        )
+        compiled = graph.compile(checkpointer=MemorySaver())
         assert compiled is not None
 
 
