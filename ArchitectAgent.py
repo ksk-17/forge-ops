@@ -5,21 +5,21 @@ import logging
 import textwrap
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
+import sys, select, os
 
 from anthropic import Anthropic
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, START, END
-from langgraph.types import interrupt
+from langgraph.types import interrupt, Command
 from typing_extensions import TypedDict
-
 from models import ArchitectureSpec, Question, RequirementsReview, UserAnswer
 
 logger = logging.getLogger(__name__)
 
-MODEL = "claude-haiku-4-5"
+MODEL = "claude-opus-4-5"
 MAX_CLARIFICATION_ROUNDS = 4
 COMPLETENESS_THRESHOLD = 8
-MAX_QUESTIONS_PER_ROUND = 4
+MAX_QUESTIONS_PER_ROUND = 3
 
 class ArchitectState(TypedDict):
     project_id: str
@@ -34,6 +34,7 @@ class ArchitectState(TypedDict):
     architecture_spec: Optional[ArchitectureSpec]
 
 # Helpers
+
 def _llm(system: str, user: str, max_tokens: int = 2048) -> str:
     client = Anthropic()
     response = client.messages.create(
@@ -130,18 +131,35 @@ def _render_understanding(understanding: str, answers: List[UserAnswer]) -> str:
     ]
     return "\n".join(lines)
 
+
+# Graph nodes
+
 def analyse_input(state: ArchitectState) -> Dict[str, Any]:
     system = textwrap.dedent("""
-        You are a senior software architect gathering requirements from a client.
-        Read their initial project description carefully.
+        You are a senior software architect turning a client's rough idea into a
+        structured understanding.
 
-        Produce a structured understanding in plain text with these sections:
+        Read their description and produce a document with these sections:
+
         ## What is clear
-        ## What is implied (reasonable assumptions)
-        ## What is missing or ambiguous
+        (Things explicitly stated by the client)
+
+        ## Assumed by default
+        (Industry-standard assumptions you will make WITHOUT asking — e.g. REST
+        for APIs, PostgreSQL for relational storage, pytest for testing, error
+        handling via exceptions, etc. Be generous here: assume the obvious.)
+
+        ## Critical gaps — must ask
+        (ONLY list things where a wrong assumption would cause a fundamentally
+        different architecture. Examples: "Is this a web API or a CLI?" or
+        "Does this need real-time sync?". Do NOT list style/naming/format
+        preferences — those can always be decided by the engineer.)
+
         ## Initial project name suggestion
 
-        Be concise but thorough. Do not ask questions yet — just analyse.
+        Rule: if a reasonable default exists for something, assume it and list it
+        under "Assumed by default". Only move something to "Critical gaps" if
+        getting it wrong would waste significant engineering effort.
     """).strip()
 
     understanding = _llm(system, f"Project description:\n{state['raw_input']}")
@@ -168,25 +186,35 @@ def generate_questions(state: ArchitectState) -> Dict[str, Any]:
         )
 
     system = textwrap.dedent(f"""
-        You are a senior software architect clarifying requirements.
-        Generate up to {MAX_QUESTIONS_PER_ROUND} targeted questions to fill
-        the gaps identified in the current understanding.
+        You are a senior software architect clarifying only the most critical
+        unknowns before writing an architecture specification.
 
-        Each question must have a clear purpose — only ask what is genuinely
-        needed to write a complete architecture specification.
+        STRICT RULES — violating these wastes the user's time:
+        1. Ask at most {MAX_QUESTIONS_PER_ROUND} questions per round.
+        2. Only ask about things where a WRONG assumption would cause a
+           fundamentally different system design (e.g. wrong database engine,
+           wrong deployment target, missing core feature category).
+        3. DO NOT ask about: naming conventions, output formatting, error message
+           verbosity, priority scales, date formats, confirmation dialogs,
+           installation method, pip packaging, CLI library choice, or any other
+           detail that a competent engineer would decide without client input.
+        4. If there are fewer than {MAX_QUESTIONS_PER_ROUND} truly critical
+           unknowns, output fewer questions. An empty array [] is valid and
+           preferred over asking unnecessary questions.
+        5. Assume standard industry defaults for everything not asked about.
 
-        Question types available:
-          yes_no          — for binary decisions
-          multiple_choice — when there are 2-4 distinct options
-          text            — for open-ended clarification
+        Question types:
+          yes_no          — for binary architectural decisions
+          multiple_choice — when options lead to genuinely different designs
+          text            — only for open-ended unknowns with no obvious default
 
         Output a JSON array ONLY. No markdown, no explanation. Each item:
         {{
           "id": "q<N>",
-          "question": "<question text>",
+          "question": "<question text — plain, no jargon>",
           "type": "yes_no" | "multiple_choice" | "text",
           "options": ["<opt1>", "<opt2>"] or null,
-          "reason": "<why this affects the architecture>"
+          "reason": "<one sentence: what architectural decision this unlocks>"
         }}
     """).strip()
 
@@ -290,14 +318,19 @@ def incorporate_answers(state: ArchitectState) -> Dict[str, Any]:
 
 def check_completeness(state: ArchitectState) -> Dict[str, Any]:
     system = textwrap.dedent("""
-        You are a senior architect assessing requirements completeness.
+        You are a senior architect deciding whether requirements are complete
+        enough to write a solid architecture spec.
 
-        Score the understanding from 0 to 10:
-          10 — everything needed to write a full architecture spec is known
-           8 — minor gaps but sufficient to proceed
-           6 — important gaps remain, another round would help significantly
-           4 — major gaps, architecture would be guesswork
-           0 — essentially no requirements
+        Score from 0-10 using this guide:
+          10 — complete: all architectural decisions are known
+           8 — sufficient: core shape is clear, minor details can be assumed
+           6 — one more round of questions would significantly help
+           4 — fundamental unknowns remain (e.g. don't know if web or CLI)
+           0 — no useful information
+
+        Key principle: if the core system shape is clear (what it does, how
+        it stores data, who uses it), score >= 8 even if minor details are
+        missing. Engineers fill in minor details — clients define the shape.
 
         Respond with EXACTLY this format (nothing else):
         SCORE: <integer>
@@ -455,6 +488,7 @@ def produce_architecture_spec(state: ArchitectState) -> Dict[str, Any]:
     return {"architecture_spec": spec}
 
 # Conditional edges
+
 def route_after_completeness(
     state: ArchitectState,
 ) -> Literal["generate_questions", "present_summary"]:
@@ -491,7 +525,9 @@ def route_after_review(
         logger.info("route_after_review → __end__ (user rejected)")
         return "__end__"
 
+
 # Graph assembly
+
 def build_architect_graph() -> StateGraph:
     graph = StateGraph(ArchitectState)
 
@@ -543,10 +579,58 @@ def build_architect_graph() -> StateGraph:
 def create_architect_agent(checkpointer=None):
     if checkpointer is None:
         checkpointer = MemorySaver()
-    return build_architect_graph().compile(
-        checkpointer=checkpointer,
-        interrupt_before=["ask_user", "present_summary"],
-    )
+    return build_architect_graph().compile(checkpointer=checkpointer)
+
+
+def _drain_stdin() -> None:
+    try:
+        # Only meaningful on Unix ttys; select on Windows stdin is limited
+        if sys.stdin.isatty() and hasattr(select, "select"):
+            while select.select([sys.stdin], [], [], 0)[0]:
+                ch = os.read(sys.stdin.fileno(), 1024)
+                if not ch:
+                    break
+    except Exception:
+        pass   # Non-fatal — worst case the next input() gets a stale newline
+
+
+def _read_line(prompt: str = "") -> str:
+    if prompt:
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+    try:
+        return sys.stdin.readline().rstrip("\n").rstrip("\r")
+    except EOFError:
+        return ""
+
+
+def _collect_question_answers(n_questions: int) -> str:
+    _drain_stdin()
+    lines = []
+    while True:
+        line = _read_line()
+        if line == "" and lines:    # blank line after answers → submit
+            break
+        if line == "":
+            continue                # leading blank → ignore
+        lines.append(line)
+        if len(lines) >= n_questions:
+            # Drain the terminating blank line the user typed
+            _drain_stdin()
+            break
+    return "\n".join(lines)
+
+
+def _extract_interrupt(event: dict) -> str:
+    raw = event.get("__interrupt__", ())
+    if not raw:
+        return ""
+    first = raw[0]
+    val = getattr(first, "value", None)
+    if val is not None:
+        return str(val)
+    return str(first)
+
 
 def run_architect_cli(project_id: str, raw_input: str) -> Optional[ArchitectureSpec]:
     agent = create_architect_agent()
@@ -565,61 +649,61 @@ def run_architect_cli(project_id: str, raw_input: str) -> Optional[ArchitectureS
         "architecture_spec": None,
     }
 
-    # First invocation — runs until the first interrupt
-    result = agent.invoke(initial_state, config)
+    input_val: Any = initial_state
 
-    # Drive the interrupt/resume loop
     while True:
+        # ── Run / resume the graph until it interrupts or finishes ────────
+        interrupt_prompt = ""
+        for event in agent.stream(input_val, config, stream_mode="updates"):
+            prompt = _extract_interrupt(event)
+            if prompt:
+                interrupt_prompt = prompt
+                break          # stop consuming — graph is paused, collect input now
+
+        # ── Graph finished (no interrupt) ─────────────────────────────────
+        if not interrupt_prompt:
+            break
+
+        # ── Identify which human node interrupted ─────────────────────────
+        # state.next is the most reliable signal; the prompt text is backup.
         state = agent.get_state(config)
+        next_node = state.next[0] if state.next else ""
 
-        # Check if the graph has finished
-        if not state.next:
-            break
+        # ── ask_user ──────────────────────────────────────────────────────
+        if next_node == "ask_user" or "CLARIFYING QUESTIONS" in interrupt_prompt:
+            print(interrupt_prompt)
+            import sys; sys.stdout.flush()
+            n_questions = len(state.values.get("questions", [])) or 1
+            human_input = _collect_question_answers(n_questions)
+            input_val = Command(resume=human_input)
 
-        next_node = state.next[0]
-
-        # ── ask_user interrupt ──────────────────────────────────────────
-        if next_node == "ask_user":
-            # The interrupt value is the question prompt string
-            interrupt_value = _get_interrupt_value(state)
-            print(interrupt_value)
-
-            # Collect answers line by line until blank line
+        # ── present_summary ───────────────────────────────────────────────
+        elif next_node == "present_summary" or "UNDERSTANDING OF YOUR REQUIREMENTS" in interrupt_prompt:
+            print(interrupt_prompt)
             print()
-            lines = []
-            while True:
-                try:
-                    line = input()
-                    if line == "":
-                        break
-                    lines.append(line)
-                except EOFError:
-                    break
-
-            human_input = "\n".join(lines)
-            agent.update_state(config, {"human_input": human_input}, as_node="ask_user")
-            agent.invoke(None, config)
-
-        # ── present_summary interrupt ───────────────────────────────────
-        elif next_node == "present_summary":
-            interrupt_value = _get_interrupt_value(state)
-            print(interrupt_value)
-            print()
-
-            try:
-                decision = input("  Your decision: ").strip()
-            except EOFError:
+            # Drain any stale bytes (e.g. the blank line from the last answer
+            # block) before reading the decision — without this, input()
+            # returns "" immediately and the decision is silently "rejected".
+            _drain_stdin()
+            decision = _read_line("  Your decision (accept / change: <notes> / reject): ").strip()
+            if not decision:
+                decision = _read_line("  (Type accept, change: <notes>, or reject): ").strip()
+            if not decision:
                 decision = "reject"
+            input_val = Command(resume=decision)
 
-            agent.update_state(config, {"human_input": decision}, as_node="present_summary")
-            agent.invoke(None, config)
-
+        # ── unknown interrupt ─────────────────────────────────────────────
         else:
-            # Non-interrupt node — shouldn't happen, but break to avoid infinite loop
-            logger.warning("Unexpected next node: %s", next_node)
-            break
+            logger.warning("Unexpected interrupt at node=%s", next_node)
+            print(interrupt_prompt)
+            print()
+            try:
+                answer = input("  Your response: ").strip()
+            except EOFError:
+                answer = ""
+            input_val = Command(resume=answer)
 
-    # Retrieve final state
+    # ── Retrieve final spec ───────────────────────────────────────────────
     final_state = agent.get_state(config).values
     spec = final_state.get("architecture_spec")
 
@@ -629,14 +713,9 @@ def run_architect_cli(project_id: str, raw_input: str) -> Optional[ArchitectureS
             project_id, spec["project_name"], len(spec["spec_text"]),
         )
     else:
-        logger.info("[%s] No architecture spec produced (user rejected or aborted).", project_id)
+        logger.info(
+            "[%s] No architecture spec produced (user rejected or aborted).",
+            project_id,
+        )
 
     return spec
-
-
-def _get_interrupt_value(state) -> str:
-    # LangGraph stores interrupt values in state.tasks[*].interrupts[*].value
-    for task in state.tasks:
-        for interrupt_obj in getattr(task, "interrupts", []):
-            return str(getattr(interrupt_obj, "value", ""))
-    return ""

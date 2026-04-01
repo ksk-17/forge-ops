@@ -1,9 +1,6 @@
 import sys
 from pathlib import Path
 
-from ArchitectAgent import run_architect_cli
-from TeamLeadAgent import run_teamlead
-
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
@@ -25,6 +22,9 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger("architect_demo")
+
+from ArchitectAgent import run_architect_cli
+from TeamLeadAgent import run_teamlead
 
 def bootstrap_project(project_id: str) -> Path:
     """Create project directory structure."""
