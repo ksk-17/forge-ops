@@ -254,3 +254,33 @@ def test_finished_workers_are_hidden_and_return_when_retried():
     assert "worker-a" not in text and "1 finished" in text
     s.apply(ev("node_start", node="plan_task", **w))
     assert "worker-a" in _workers_text(s)
+
+
+import threading
+
+
+def test_keyboard_interrupt_waits_for_pipeline_thread_to_stop(monkeypatch):
+    import time as _time
+    from forge_events import clear_cancel, is_cancelled
+
+    ui, _ = make_ui(terminal=False)
+    finished = threading.Event()
+
+    def raise_ki(*a, **k):
+        raise KeyboardInterrupt
+
+    def pipeline():
+        ui.request_input("questions", {"questions": [QUESTIONS[2]]})
+        while not is_cancelled():
+            _time.sleep(0.01)
+        _time.sleep(0.1)
+        finished.set()
+
+    monkeypatch.setattr(builtins, "input", raise_ki)
+    clear_cancel()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            ui.run(pipeline)
+        assert finished.is_set()  # ui.run waited for the pipeline to wind down
+    finally:
+        clear_cancel()

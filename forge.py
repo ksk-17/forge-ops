@@ -2,7 +2,7 @@
 forge.py — single entry point: idea → Architect → TeamLead → Workers, with a Rich UI.
 
     python forge.py "build a todo CLI"
-    python forge.py            # prompts for the idea
+    python forge.py            # opens an interactive forge> prompt
 """
 
 from __future__ import annotations
@@ -14,11 +14,11 @@ import os
 import re
 import sys
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from rich.console import Console
-from rich.prompt import Prompt
 from rich.text import Text
 
 try:
@@ -29,7 +29,8 @@ except ImportError:  # python-dotenv is optional at runtime
 
 from ArchitectAgent import run_architect
 from TeamLeadAgent import run_teamlead
-from forge_events import emit, get_bus, telemetry_subscriber
+from forge_events import EventBus, emit, set_bus, telemetry_subscriber
+from forge_session import Session
 from forge_ui import ForgeUI
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -83,28 +84,18 @@ def run_pipeline(idea: str, project_id: str, ui: ForgeUI, project_dir: Path) -> 
     return report
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    make_output_safe(sys.stdout)
-    make_output_safe(sys.stderr)
-    # Agents and tools use paths relative to the working directory (projects/...).
-    os.chdir(PROJECT_ROOT)
-    load_dotenv(PROJECT_ROOT / ".env")
-    parser = argparse.ArgumentParser(prog="forge", description="Idea to code with a live agent dashboard.")
-    parser.add_argument("idea", nargs="?", help="project idea (prompted if omitted)")
-    parser.add_argument("--project-id", help="reuse or choose a project id")
-    args = parser.parse_args(argv)
+@dataclass
+class RunResult:
+    report: Optional[Dict[str, Any]]
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    log_path: Path
 
-    console = Console()
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        console.print("[red]ANTHROPIC_API_KEY is not set.[/] Put it in .env or the environment.")
-        return 2
 
-    idea = (args.idea or Prompt.ask("Describe your project idea", console=console)).strip()
-    if not idea:
-        console.print("[red]No idea given.[/]")
-        return 2
-
-    project_id = args.project_id or make_project_id(idea)
+def execute_run(console: Console, idea: str, project_id: Optional[str] = None) -> RunResult:
+    """Run one project end to end behind the live dashboard."""
+    project_id = project_id or make_project_id(idea)
     project_dir = bootstrap_project(project_id)
 
     # Agent logging would corrupt the live display; send it to a file instead.
@@ -114,8 +105,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         format="%(asctime)s %(levelname)-8s %(name)s - %(message)s",
     )
 
-    bus = get_bus()
+    # A fresh bus per run: its own run_id, and no UI subscribers left from earlier runs.
+    bus = EventBus()
     bus.project_id = project_id
+    set_bus(bus)
     bus.subscribe(telemetry_subscriber)
     ui = ForgeUI(bus, console)
     ui.state.project_id = project_id
@@ -123,14 +116,43 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         report = ui.run(lambda: run_pipeline(idea, project_id, ui, project_dir))
     except KeyboardInterrupt:
-        return 130
+        raise
     except Exception:
         logging.getLogger("forge").exception("forge run failed")
-        console.print(Text(f"Run failed. Traceback is in {log_path}"))
-        return 1
+        raise
 
     ui.print_summary(report)
     console.print(Text(f"Log: {log_path}"))
+    return RunResult(report, ui.state.input_tokens, ui.state.output_tokens, ui.state.cost_usd, log_path)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    make_output_safe(sys.stdout)
+    make_output_safe(sys.stderr)
+    # Agents and tools use paths relative to the working directory (projects/...).
+    os.chdir(PROJECT_ROOT)
+    load_dotenv(PROJECT_ROOT / ".env")
+    parser = argparse.ArgumentParser(prog="forge", description="Idea to code with a live agent dashboard.")
+    parser.add_argument("idea", nargs="?", help="project idea; omit to open the interactive forge> prompt")
+    parser.add_argument("--project-id", help="reuse or choose a project id (one-shot mode)")
+    args = parser.parse_args(argv)
+
+    console = Console()
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        console.print("[red]ANTHROPIC_API_KEY is not set.[/] Put it in .env or the environment.")
+        return 2
+
+    if not args.idea:
+        return Session(console, lambda idea: execute_run(console, idea), PROJECT_ROOT / "projects").loop()
+
+    try:
+        result = execute_run(console, args.idea.strip(), args.project_id)
+    except KeyboardInterrupt:
+        return 130
+    except Exception:
+        console.print(Text("Run failed. The traceback is in the project's forge.log."))
+        return 1
+    report = result.report
     return 0 if report and report["final_status"] != "failed" else 1
 
 

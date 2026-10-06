@@ -88,3 +88,42 @@ def test_main_logs_traceback_when_pipeline_fails(monkeypatch, tmp_path, fresh_bu
         for h in list(logging.getLogger().handlers):
             h.close()
             logging.getLogger().removeHandler(h)
+
+
+def _result(report):
+    return forge.RunResult(report=report, input_tokens=0, output_tokens=0,
+                           cost_usd=0.0, log_path=Path("x.log"))
+
+
+def _ready(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setattr(forge, "load_dotenv", lambda *a, **k: None)
+
+
+def test_main_without_idea_starts_interactive_session(monkeypatch, tmp_path):
+    _ready(monkeypatch, tmp_path)
+    session = MagicMock()
+    session.loop.return_value = 0
+    with patch.object(forge, "Session", return_value=session):
+        assert forge.main([]) == 0
+    session.loop.assert_called_once()
+
+
+def test_main_with_idea_runs_once_and_maps_exit_code(monkeypatch, tmp_path):
+    _ready(monkeypatch, tmp_path)
+    for report, expected in (({"final_status": "success"}, 0),
+                             ({"final_status": "partial"}, 0),
+                             ({"final_status": "failed"}, 1),
+                             (None, 1)):
+        with patch.object(forge, "execute_run", return_value=_result(report)) as run:
+            assert forge.main(["an idea"]) == expected
+        assert run.call_args.args[1] == "an idea"
+
+
+def test_main_with_idea_maps_ctrl_c_and_errors(monkeypatch, tmp_path):
+    _ready(monkeypatch, tmp_path)
+    with patch.object(forge, "execute_run", side_effect=KeyboardInterrupt):
+        assert forge.main(["an idea"]) == 130
+    with patch.object(forge, "execute_run", side_effect=RuntimeError("boom")):
+        assert forge.main(["an idea"]) == 1

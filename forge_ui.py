@@ -292,6 +292,7 @@ class ForgeUI:
         thread.start()
         if live:
             live.start()
+        pending: Optional[_InputRequest] = None
         try:
             while not self._done.is_set():
                 try:
@@ -300,16 +301,21 @@ class ForgeUI:
                     if live:
                         live.update(render_dashboard(self.state))
                     continue
+                pending = request
                 if live:
                     live.stop()
                 request.reply.put(self._prompt(request))
+                pending = None
                 if live:
                     live.start()
         except KeyboardInterrupt:
             cancel_run()  # workers stop at their next node / LLM-call boundary
+            if pending is not None:
+                pending.reply.put("reject")  # unblock a pipeline waiting on this prompt
             self.console.print(Text(
                 "Interrupted. Workers stop at their next step; in-flight LLM calls "
                 "finish first (Ctrl+C again to force quit).", style="yellow"))
+            thread.join(timeout=30)
             raise
         finally:
             if live:
