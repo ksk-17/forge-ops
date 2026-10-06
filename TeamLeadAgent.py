@@ -23,6 +23,7 @@ from WorkerTools import (
 )
 from WorkerAgent import run_worker, WorkerReport
 from forge_memory import get_teamlead_context, record_teamlead_run
+from forge_events import emit, track, traced_node
  
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,17 @@ def _save_registry(project_id: str, registry: Dict[str, TaskRecord]) -> None:
     with open(p, "w") as f:
         json.dump(list(registry.values()), f, indent=2)
 
+def _emit_task_status(rec: Dict) -> None:
+    report = rec.get("report") or {}
+    first_line = (rec.get("desc", "").strip().splitlines() or [""])[0]
+    emit("task_status", agent="teamlead", task_id=rec["task_id"], metadata={
+        "status": rec["status"],
+        "dependency_list": list(rec.get("dependency_list", [])),
+        "retry_count": rec.get("retry_count", 0),
+        "review_score": report.get("review_score"),
+        "desc": first_line[:100],
+    })
+
 def _update_task_status(
     project_id: str,
     task_id: str,
@@ -87,6 +99,7 @@ def _update_task_status(
         rec["retry_count"] = retry_count
     registry[task_id] = rec
     _save_registry(project_id, registry)
+    _emit_task_status(rec)
 
 def _ready_tasks(registry: Dict[str, TaskRecord]) -> List[TaskRecord]:
     """
@@ -155,10 +168,11 @@ def _parse_summary(text: str) -> str:
     return " ".join(parts).strip()
 
 # nodes
+@traced_node("teamlead")
 def decompose_tasks(state: TeamLeadState) -> Dict[str, Any]:
     project_id = state["project_id"]
     arch_spec = state["architecture_spec"]
-    client = Anthropic()
+    client = track(Anthropic(), "teamlead")
 
     memory_ctx = get_teamlead_context(project_id, arch_spec[:300])
  
@@ -246,6 +260,8 @@ def decompose_tasks(state: TeamLeadState) -> Dict[str, Any]:
         registry[tid] = rec
  
     _save_registry(project_id, registry)
+    for rec in registry.values():
+        _emit_task_status(rec)
  
     logger.info(
         "[%s] Decomposed into %d tasks: %s",
@@ -268,6 +284,7 @@ def decompose_tasks(state: TeamLeadState) -> Dict[str, Any]:
         ],
     }
 
+@traced_node("teamlead")
 def schedule_iteration(state: TeamLeadState) -> Dict[str, Any]:
     project_id = state["project_id"]
     registry = _load_registry(project_id)
@@ -286,6 +303,9 @@ def schedule_iteration(state: TeamLeadState) -> Dict[str, Any]:
             registry[tid] = rec
  
     _save_registry(project_id, registry)
+    for tid in state.get("retry_queue", []):
+        if tid in registry:
+            _emit_task_status(registry[tid])
  
     batch = _ready_tasks(registry)
     batch_ids = [t["task_id"] for t in batch]
@@ -302,6 +322,7 @@ def schedule_iteration(state: TeamLeadState) -> Dict[str, Any]:
         "retry_queue": [],  # consumed
     }
 
+@traced_node("teamlead")
 def dispatch_workers(state: TeamLeadState) -> Dict[str, Any]:
     project_id = state["project_id"]
     batch_ids = state["current_batch"]
@@ -398,6 +419,7 @@ def dispatch_workers(state: TeamLeadState) -> Dict[str, Any]:
         "all_touched_files": all_touched,
     }
 
+@traced_node("teamlead")
 def collect_reports(state: TeamLeadState) -> Dict[str, Any]:
     project_id = state["project_id"]
     registry = _load_registry(project_id)
@@ -423,9 +445,10 @@ def collect_reports(state: TeamLeadState) -> Dict[str, Any]:
     return {"retry_queue": retry_queue}
  
  
+@traced_node("teamlead")
 def review_batch(state: TeamLeadState) -> Dict[str, Any]:
     project_id = state["project_id"]
-    client = Anthropic()
+    client = track(Anthropic(), "teamlead")
  
     # Read all touched files across the current batch
     batch_ids = state.get("current_batch", [])
@@ -541,6 +564,7 @@ def review_batch(state: TeamLeadState) -> Dict[str, Any]:
     }
  
  
+@traced_node("teamlead")
 def handle_batch_review(state: TeamLeadState) -> Dict[str, Any]:
     project_id = state["project_id"]
     review = state.get("latest_review")
@@ -563,10 +587,11 @@ def handle_batch_review(state: TeamLeadState) -> Dict[str, Any]:
     return {}
  
  
+@traced_node("teamlead")
 def finalize(state: TeamLeadState) -> Dict[str, Any]:
     project_id = state["project_id"]
     registry = _load_registry(project_id)
-    client = Anthropic()
+    client = track(Anthropic(), "teamlead")
  
     counts = _counts(registry)
     all_touched = state.get("all_touched_files", [])
