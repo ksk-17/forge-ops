@@ -104,28 +104,6 @@ class ArchitectureSpec(TypedDict):
     spec_text: str
     created_at: str
 
-class Question(TypedDict):
-    id: str
-    question: str
-    type: Literal["yes_no", "multiple_choice", "text"]
-    options: Optional[List[str]]
-    reason: str
-
-class UserAnswer(TypedDict):
-    question_id: str
-    question: str
-    answer: str
-
-class RequirementsReview(TypedDict):
-    decision: Literal["accepted", "change", "rejected"]
-    change_notes: str
-
-class ArchitectureSpec(TypedDict):
-    project_id: str
-    project_name: str
-    spec_text: str
-    created_at: str
-
 class RunRecord(TypedDict):
     run_id: str
     project_id: str
