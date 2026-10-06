@@ -1,6 +1,6 @@
 import json
 import time
-import fcntl
+import portalocker
 import logging
 from typing import Dict, Optional
 
@@ -26,7 +26,7 @@ def acquire_lock(project_id: str, worker_id: str, file_path: str) -> Optional[st
     lock_abs_file_path = lock_file_path.format(project_id=project_id)
 
     with open(lock_abs_file_path, "r+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+        portalocker.lock(f, portalocker.LOCK_EX)
         try:
             locks_json = json.load(f)
             lock_info = check_lock(locks_json, file_path)
@@ -43,7 +43,7 @@ def acquire_lock(project_id: str, worker_id: str, file_path: str) -> Optional[st
             f.truncate()
             json.dump(locks_json, f, indent=2)
         finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+            portalocker.unlock(f)
 
     return None  # success
 
@@ -52,7 +52,7 @@ def remove_lock(project_id: str, worker_id: str, file_path: str) -> Optional[str
     lock_abs_file_path = lock_file_path.format(project_id=project_id)
 
     with open(lock_abs_file_path, "r+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+        portalocker.lock(f, portalocker.LOCK_EX)
         try:
             locks_json = json.load(f)
             lock_info = check_lock(locks_json, file_path)
@@ -71,7 +71,7 @@ def remove_lock(project_id: str, worker_id: str, file_path: str) -> Optional[str
             f.truncate()
             json.dump(locks_json, f, indent=2)
         finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+            portalocker.unlock(f)
 
     return None  # success
 
