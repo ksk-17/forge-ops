@@ -209,3 +209,48 @@ def test_print_summary_handles_none_and_report():
     })
     text = out.getvalue()
     assert "src/a.py" in text and "success" in text and "ok [/x]" in text
+
+
+from forge_events import clear_cancel, is_cancelled
+from forge_ui import _render_workers
+
+
+def test_keyboard_interrupt_during_prompt_cancels_run_and_propagates(monkeypatch):
+    ui, _ = make_ui(terminal=False)
+
+    def raise_ki(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(builtins, "input", raise_ki)
+    clear_cancel()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            ui.run(lambda: ui.request_input("questions", {"questions": [QUESTIONS[2]]}))
+        assert is_cancelled()
+    finally:
+        clear_cancel()
+
+
+def test_run_clears_a_stale_cancel_flag():
+    from forge_events import cancel_run
+    ui, _ = make_ui()
+    cancel_run()
+    assert ui.run(lambda: 1) == 1
+    assert not is_cancelled()
+
+
+def _workers_text(state):
+    console = Console(file=io.StringIO(), width=100, record=True, force_terminal=False)
+    console.print(_render_workers(state))
+    return console.export_text()
+
+
+def test_finished_workers_are_hidden_and_return_when_retried():
+    s = UIState()
+    w = dict(agent="worker", worker_id="worker-a", task_id="a")
+    s.apply(ev("node_start", node="plan_task", **w))
+    s.apply(ev("node_end", node="report_to_teamlead", **w))
+    text = _workers_text(s)
+    assert "worker-a" not in text and "1 finished" in text
+    s.apply(ev("node_start", node="plan_task", **w))
+    assert "worker-a" in _workers_text(s)

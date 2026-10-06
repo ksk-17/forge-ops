@@ -70,7 +70,7 @@ def _save_registry(project_id: str, registry: Dict[str, TaskRecord]) -> None:
 
 def _emit_task_status(rec: Dict) -> None:
     report = rec.get("report") or {}
-    first_line = (rec.get("desc", "").strip().splitlines() or [""])[0]
+    first_line = (str(rec.get("desc") or "").strip().splitlines() or [""])[0]
     emit("task_status", agent="teamlead", task_id=rec["task_id"], metadata={
         "status": rec["status"],
         "dependency_list": list(rec.get("dependency_list", [])),

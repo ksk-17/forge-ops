@@ -235,3 +235,34 @@ def test_traced_node_preserves_signature_and_resets_context(fresh_bus):
     assert list(inspect.signature(plan_task).parameters) == ["state"]
     plan_task({"worker_id": "worker-a"})
     assert emit("llm_call")["worker_id"] is None
+
+
+from forge_events import RunCancelled, cancel_run, clear_cancel, is_cancelled
+
+
+@pytest.fixture
+def clean_cancel():
+    clear_cancel()
+    yield
+    clear_cancel()
+
+
+def test_traced_node_refuses_to_start_after_cancel(fresh_bus, clean_cancel):
+    called = []
+
+    @traced_node("worker")
+    def plan_task(state):
+        called.append(1)
+
+    cancel_run()
+    with pytest.raises(RunCancelled):
+        plan_task({})
+    assert called == [] and is_cancelled()
+
+
+def test_track_refuses_llm_call_after_cancel(fresh_bus, clean_cancel):
+    client = MagicMock()
+    cancel_run()
+    with pytest.raises(RunCancelled):
+        track(client, "a").messages.create(model="claude-haiku-4-5")
+    client.messages.create.assert_not_called()

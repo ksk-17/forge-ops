@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from rich.console import Console
 from rich.prompt import Prompt
+from rich.text import Text
 
 try:
     from dotenv import load_dotenv
@@ -32,6 +33,12 @@ from forge_events import emit, get_bus, telemetry_subscriber
 from forge_ui import ForgeUI
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def make_output_safe(stream: Any) -> None:
+    """Never raise on glyphs the console encoding lacks (e.g. cp1252 when piped)."""
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(errors="replace")
 
 
 def make_project_id(idea: str) -> str:
@@ -77,6 +84,10 @@ def run_pipeline(idea: str, project_id: str, ui: ForgeUI, project_dir: Path) -> 
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    make_output_safe(sys.stdout)
+    make_output_safe(sys.stderr)
+    # Agents and tools use paths relative to the working directory (projects/...).
+    os.chdir(PROJECT_ROOT)
     load_dotenv(PROJECT_ROOT / ".env")
     parser = argparse.ArgumentParser(prog="forge", description="Idea to code with a live agent dashboard.")
     parser.add_argument("idea", nargs="?", help="project idea (prompted if omitted)")
@@ -114,11 +125,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     except KeyboardInterrupt:
         return 130
     except Exception:
-        console.print(f"Details are in {log_path}")
+        logging.getLogger("forge").exception("forge run failed")
+        console.print(Text(f"Run failed. Traceback is in {log_path}"))
         return 1
 
     ui.print_summary(report)
-    console.print(f"Log: {log_path}")
+    console.print(Text(f"Log: {log_path}"))
     return 0 if report and report["final_status"] != "failed" else 1
 
 

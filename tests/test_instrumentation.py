@@ -142,3 +142,10 @@ def test_decompose_emits_open_status_for_each_task(fresh_bus, tmp_path, monkeypa
     }
     assert set(rows) == {"a", "b"}
     assert rows["b"]["dependency_list"] == ["a"] and rows["b"]["status"] == "Open"
+
+
+def test_emit_task_status_tolerates_null_desc(fresh_bus):
+    rec = _rec("a")
+    rec["desc"] = None
+    tl._emit_task_status(rec)
+    assert fresh_bus.history()[-1]["metadata"]["desc"] == ""

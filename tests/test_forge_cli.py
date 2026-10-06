@@ -49,3 +49,42 @@ def test_run_pipeline_passes_spec_text_to_teamlead_and_saves_spec(tmp_path):
     assert (tmp_path / "architecture_spec.md").read_text() == "# Spec"
     assert ui.state.set_phase.call_args_list[0].args == ("architect",)
     assert ui.state.set_phase.call_args_list[1].args == ("execution",)
+
+
+import io
+import logging
+
+
+def test_make_output_safe_replaces_unencodable_instead_of_raising():
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="cp1252")
+    forge.make_output_safe(stream)
+    stream.write("▶ ok")
+    stream.flush()
+    assert raw.getvalue().startswith(b"? ok")
+
+
+def test_main_enters_project_root(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(forge, "load_dotenv", lambda *a, **k: None)
+    forge.main(["x"])
+    assert Path.cwd() == forge.PROJECT_ROOT
+
+
+def test_main_logs_traceback_when_pipeline_fails(monkeypatch, tmp_path, fresh_bus):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(forge, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "x")
+    monkeypatch.setattr(forge, "load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr(forge, "run_pipeline", MagicMock(side_effect=RuntimeError("kaboom")))
+    try:
+        assert forge.main(["idea", "--project-id", "p1"]) == 1
+        for h in logging.getLogger().handlers:
+            h.flush()
+        log = (tmp_path / "projects" / "p1" / "forge.log").read_text(encoding="utf-8")
+        assert "kaboom" in log and "Traceback" in log
+    finally:
+        for h in list(logging.getLogger().handlers):
+            h.close()
+            logging.getLogger().removeHandler(h)

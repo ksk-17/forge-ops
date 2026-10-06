@@ -187,6 +187,32 @@ def telemetry_subscriber(event: Dict[str, Any]) -> None:
         TelemetryStore.log_event(record)
 
 
+# ── cancellation ───────────────────────────────────────────────────────────
+
+class RunCancelled(Exception):
+    """Raised at the next node or LLM-call boundary after the user cancels."""
+
+
+_cancel = threading.Event()
+
+
+def cancel_run() -> None:
+    _cancel.set()
+
+
+def clear_cancel() -> None:
+    _cancel.clear()
+
+
+def is_cancelled() -> bool:
+    return _cancel.is_set()
+
+
+def _raise_if_cancelled() -> None:
+    if _cancel.is_set():
+        raise RunCancelled("run cancelled by user")
+
+
 # ── LLM-call tracking ──────────────────────────────────────────────────────
 
 def _as_int(value: Any) -> int:
@@ -200,6 +226,7 @@ class _TrackedMessages:
         self._agent = agent
 
     def create(self, **kwargs: Any) -> Any:
+        _raise_if_cancelled()
         model = kwargs.get("model", "")
         started = time.monotonic()
         try:
@@ -256,6 +283,7 @@ def traced_node(agent: str) -> Callable:
 
         @functools.wraps(fn)
         def wrapper(state: Any, *args: Any, **kwargs: Any) -> Any:
+            _raise_if_cancelled()
             fields: Dict[str, Any] = {"agent": agent, "node": node}
             if isinstance(state, Mapping):
                 if state.get("worker_id"):

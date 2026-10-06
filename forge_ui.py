@@ -24,7 +24,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from forge_events import EventBus, emit
+from forge_events import EventBus, cancel_run, clear_cancel, emit
 
 STATUS_STYLE = {
     "Open": "dim",
@@ -138,6 +138,7 @@ class UIState:
             elif kind == "node_start" and w:
                 w.node = event["node"]
                 w.tool = ""
+                w.done = False  # a retry reuses worker-<task_id>
                 if event["node"] == "rework_task":
                     w.rework += 1
             elif kind == "node_end" and w and event["node"] == "report_to_teamlead":
@@ -194,10 +195,13 @@ def _render_tasks(state: UIState) -> Panel:
 
 
 def _render_workers(state: UIState) -> Panel:
-    if not state.workers:
-        return Panel(Text("no workers running", style="dim"), title="Workers", padding=(0, 1))
+    active = [w for w in state.workers.values() if not w.done]
+    if not active:
+        finished = len(state.workers)
+        note = "no workers running" + (f" ({finished} finished)" if finished else "")
+        return Panel(Text(note, style="dim"), title="Workers", padding=(0, 1))
     blocks: List[Text] = []
-    for w in state.workers.values():
+    for w in active:
         t = Text()
         t.append(w.worker_id, style="bold")
         t.append(f"\n  node: {w.node or '-'}")
@@ -269,6 +273,7 @@ class ForgeUI:
 
     # -- main thread -------------------------------------------------------
     def run(self, pipeline: Callable[[], Any]) -> Any:
+        clear_cancel()
         outcome: Dict[str, Any] = {}
 
         def target() -> None:
@@ -301,9 +306,10 @@ class ForgeUI:
                 if live:
                     live.start()
         except KeyboardInterrupt:
+            cancel_run()  # workers stop at their next node / LLM-call boundary
             self.console.print(Text(
-                "Interrupted. Waiting for in-flight workers to finish "
-                "(Ctrl+C again to force quit).", style="yellow"))
+                "Interrupted. Workers stop at their next step; in-flight LLM calls "
+                "finish first (Ctrl+C again to force quit).", style="yellow"))
             raise
         finally:
             if live:
