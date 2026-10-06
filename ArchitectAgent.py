@@ -14,6 +14,7 @@ from langgraph.types import interrupt, Command
 from typing_extensions import TypedDict
 from models import ArchitectureSpec, Question, RequirementsReview, UserAnswer
 from forge_memory import get_architect_context, record_architect_run
+from forge_events import track, traced_node
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ class ArchitectState(TypedDict):
 # Helpers
 
 def _llm(system: str, user: str, max_tokens: int = 2048) -> str:
-    client = Anthropic()
+    client = track(Anthropic(), "architect")
     response = client.messages.create(
         model=MODEL,
         max_tokens=max_tokens,
@@ -135,6 +136,7 @@ def _render_understanding(understanding: str, answers: List[UserAnswer]) -> str:
 
 # Graph nodes
 
+@traced_node("architect")
 def analyse_input(state: ArchitectState) -> Dict[str, Any]:
     memory_ctx = get_architect_context(state['raw_input'])
 
@@ -181,6 +183,7 @@ def analyse_input(state: ArchitectState) -> Dict[str, Any]:
     }
 
 
+@traced_node("architect")
 def generate_questions(state: ArchitectState) -> Dict[str, Any]:
     answered_ids = {a["question_id"] for a in state.get("answers", [])}
     prev_answers_block = ""
@@ -241,6 +244,7 @@ def generate_questions(state: ArchitectState) -> Dict[str, Any]:
     return {"questions": questions}
 
 
+@traced_node("architect")
 def ask_user(state: ArchitectState) -> Dict[str, Any]:
     questions = state.get("questions", [])
     if not questions:
@@ -284,6 +288,7 @@ def ask_user(state: ArchitectState) -> Dict[str, Any]:
     return {"answers": all_answers, "human_input": ""}
 
 
+@traced_node("architect")
 def incorporate_answers(state: ArchitectState) -> Dict[str, Any]:
     answers_block = "\n".join(
         f"Q: {a['question']}\nA: {a['answer']}"
@@ -321,6 +326,7 @@ def incorporate_answers(state: ArchitectState) -> Dict[str, Any]:
     }
 
 
+@traced_node("architect")
 def check_completeness(state: ArchitectState) -> Dict[str, Any]:
     system = textwrap.dedent("""
         You are a senior architect deciding whether requirements are complete
@@ -364,6 +370,7 @@ def check_completeness(state: ArchitectState) -> Dict[str, Any]:
     return {"completeness_score": score}
 
 
+@traced_node("architect")
 def present_summary(state: ArchitectState) -> Dict[str, Any]:
     display = _render_understanding(
         state["understanding"],
@@ -391,6 +398,7 @@ def present_summary(state: ArchitectState) -> Dict[str, Any]:
     return {"user_review": review, "human_input": ""}
 
 
+@traced_node("architect")
 def handle_user_review(state: ArchitectState) -> Dict[str, Any]:
     review = state.get("user_review") or {}
     if review.get("decision") == "change" and review.get("change_notes"):
@@ -408,6 +416,7 @@ def handle_user_review(state: ArchitectState) -> Dict[str, Any]:
     return {}
 
 
+@traced_node("architect")
 def produce_architecture_spec(state: ArchitectState) -> Dict[str, Any]:
     # Extract project name from understanding
     project_name = state["project_id"]
