@@ -4,7 +4,7 @@ import json
 import logging
 import textwrap
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 import sys, select, os
 
 from anthropic import Anthropic
@@ -664,11 +664,8 @@ def _extract_interrupt(event: dict) -> str:
     return str(first)
 
 
-def run_architect_cli(project_id: str, raw_input: str) -> Optional[ArchitectureSpec]:
-    agent = create_architect_agent()
-    config = {"configurable": {"thread_id": project_id}}
-
-    initial_state: ArchitectState = {
+def _initial_architect_state(project_id: str, raw_input: str) -> ArchitectState:
+    return {
         "project_id": project_id,
         "raw_input": raw_input,
         "understanding": "",
@@ -680,6 +677,46 @@ def run_architect_cli(project_id: str, raw_input: str) -> Optional[ArchitectureS
         "user_review": None,
         "architecture_spec": None,
     }
+
+
+def run_architect(
+    project_id: str,
+    raw_input: str,
+    ask_questions: Callable[[List[Question]], str],
+    ask_decision: Callable[[Dict[str, Any]], str],
+) -> Optional[ArchitectureSpec]:
+    """Drive the Architect graph, delegating human input to the callbacks."""
+    agent = create_architect_agent()
+    config = {"configurable": {"thread_id": project_id}}
+    input_val: Any = _initial_architect_state(project_id, raw_input)
+
+    while True:
+        interrupted = False
+        for event in agent.stream(input_val, config, stream_mode="updates"):
+            if _extract_interrupt(event):
+                interrupted = True
+                break
+        if not interrupted:
+            break
+
+        state = agent.get_state(config)
+        next_node = state.next[0] if state.next else ""
+        if next_node == "ask_user":
+            reply = ask_questions(state.values.get("questions", []))
+        elif next_node == "present_summary":
+            reply = ask_decision(state.values)
+        else:
+            raise RuntimeError(f"Unexpected Architect interrupt at node {next_node!r}")
+        input_val = Command(resume=reply)
+
+    return agent.get_state(config).values.get("architecture_spec")
+
+
+def run_architect_cli(project_id: str, raw_input: str) -> Optional[ArchitectureSpec]:
+    agent = create_architect_agent()
+    config = {"configurable": {"thread_id": project_id}}
+
+    initial_state = _initial_architect_state(project_id, raw_input)
 
     input_val: Any = initial_state
 
