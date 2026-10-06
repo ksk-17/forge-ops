@@ -13,10 +13,11 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt, Command
 from typing_extensions import TypedDict
 from models import ArchitectureSpec, Question, RequirementsReview, UserAnswer
+from forge_memory import get_architect_context, record_architect_run
 
 logger = logging.getLogger(__name__)
 
-MODEL = "claude-opus-4-5"
+MODEL = "claude-haiku-4-5"
 MAX_CLARIFICATION_ROUNDS = 4
 COMPLETENESS_THRESHOLD = 8
 MAX_QUESTIONS_PER_ROUND = 3
@@ -135,10 +136,14 @@ def _render_understanding(understanding: str, answers: List[UserAnswer]) -> str:
 # Graph nodes
 
 def analyse_input(state: ArchitectState) -> Dict[str, Any]:
-    system = textwrap.dedent("""
+    memory_ctx = get_architect_context(state['raw_input'])
+
+    memory_section = f"\n{memory_ctx}\n" if memory_ctx else ""
+
+    system = textwrap.dedent(f"""
         You are a senior software architect turning a client's rough idea into a
         structured understanding.
-
+        {memory_section}
         Read their description and produce a document with these sections:
 
         ## What is clear
@@ -483,6 +488,14 @@ def produce_architecture_spec(state: ArchitectState) -> Dict[str, Any]:
     logger.info(
         "[%s] produce_architecture_spec: spec ready (%d chars)",
         state["project_id"], len(spec_text),
+    )
+
+    # Record to telemetry store + mem0 memory layer
+    record_architect_run(
+        project_id=state["project_id"],
+        spec=dict(spec),
+        answers=state.get("answers", []),
+        raw_input=state.get("raw_input", ""),
     )
 
     return {"architecture_spec": spec}

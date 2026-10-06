@@ -6,3 +6,4 @@ python-dotenv
 pytest
 portalocker # for fcntl
 anthropic
+mem0ai

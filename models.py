@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Literal, List, Dict, Optional, TypedDict
+from typing import Literal, List, Dict, Optional, TypedDict, Any
 
 @dataclass
 class Edit:
@@ -125,3 +125,57 @@ class ArchitectureSpec(TypedDict):
     project_name: str
     spec_text: str
     created_at: str
+
+class RunRecord(TypedDict):
+    run_id: str
+    project_id: str
+    project_name: str
+    raw_input: str
+    architecture_spec: str
+    final_status: str
+    total_tasks: int
+    completed_tasks: int
+    failed_tasks: int
+    batch_review_scores: List[int]
+    avg_review_score: float
+    total_duration_seconds: float
+    started_at: str
+    completed_at: str
+ 
+ 
+class AgentEvent(TypedDict):
+    event_id: str
+    run_id: str
+    project_id: str
+    agent: str
+    node: str
+    task_id: Optional[str]
+    duration_seconds: float
+    success: bool
+    error: Optional[str]
+    metadata: Dict[str, Any]
+    timestamp: str
+ 
+ 
+class PromptVersion(TypedDict):
+    prompt_id: str
+    agent: str
+    node: str
+    version: int
+    content: str
+    avg_score: float
+    run_count: int
+    recorded_at: str
+ 
+ 
+class WorkerScore(TypedDict):
+    score_id: str
+    run_id: str
+    project_id: str
+    task_id: str
+    task_desc: str
+    review_score: int
+    rework_count: int
+    status: str
+    prompt_version_id: str
+    completed_at: str

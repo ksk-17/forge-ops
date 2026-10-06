@@ -18,6 +18,7 @@ from WorkerTools import (
     create_file,
     write_file,
 )
+from forge_memory import get_worker_context, record_worker_run
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +289,8 @@ def plan_task(state: WorkerState) -> Dict[str, Any]:
     task: Task = state["task"]
     client = Anthropic()
 
+    memory_ctx = get_worker_context(task.desc, task.project_id)
+
     # Read project schema for context
     try:
         schema = get_project_schema(task.project_id)
@@ -295,10 +298,14 @@ def plan_task(state: WorkerState) -> Dict[str, Any]:
     except Exception as exc:
         schema_summary = f"(Could not load project schema: {exc})"
 
+    # Prepend any relevant memory context so the planner benefits from
+    # past implementations in this project and agent-level patterns.
+    memory_section = f"\n{memory_ctx}\n" if memory_ctx else ""
+
     system = textwrap.dedent(f"""
         You are a senior software engineer planning implementation of a coding task.
         You have full context of the project schema below.
-
+        {memory_section}
         Your job: produce a clear, numbered implementation plan.
         - List every file you will create or modify (with the relative path).
         - For each file, describe exactly what functions/classes/changes are needed.
@@ -716,6 +723,13 @@ def report_to_teamlead(state: WorkerState) -> Dict[str, Any]:
     logger.info(
         "[%s] Report ready — status=%s score=%d/10 blockers=%d",
         task.task_id, status, score, len(blockers),
+    )
+
+    # Record to telemetry store + mem0 memory layer
+    record_worker_run(
+        task_id=task.task_id,
+        project_id=task.project_id,
+        report=dict(report),
     )
 
     return {"report": report}

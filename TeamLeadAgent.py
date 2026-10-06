@@ -22,6 +22,7 @@ from WorkerTools import (
     write_file,
 )
 from WorkerAgent import run_worker, WorkerReport
+from forge_memory import get_teamlead_context, record_teamlead_run
  
 logger = logging.getLogger(__name__)
 
@@ -158,6 +159,8 @@ def decompose_tasks(state: TeamLeadState) -> Dict[str, Any]:
     project_id = state["project_id"]
     arch_spec = state["architecture_spec"]
     client = Anthropic()
+
+    memory_ctx = get_teamlead_context(project_id, arch_spec[:300])
  
     # Read existing schema so we don't duplicate already-existing files
     try:
@@ -166,17 +169,19 @@ def decompose_tasks(state: TeamLeadState) -> Dict[str, Any]:
     except Exception:
         schema_ctx = "{}"
  
-    system = textwrap.dedent("""
+    memory_section = f"\n{memory_ctx}\n" if memory_ctx else ""
+
+    system = textwrap.dedent(f"""
         You are a technical team lead decomposing an architecture specification
         into concrete, independently-workable coding tasks for junior engineers.
- 
+        {memory_section}
         Output a JSON array of task objects. Each object must have EXACTLY
         these fields (no extras):
-        {
+        {{
           "task_id":        "<short slug, e.g. 'auth-model' or 'db-schema'>",
           "desc":           "<precise description: what to implement, which file(s), what interface>",
           "dependency_list": ["<task_id>", ...]   // IDs of tasks that MUST complete first
-        }
+        }}
  
         Rules:
         - Tasks must be small enough for one engineer in one session (~1-3 files).
@@ -623,6 +628,13 @@ def finalize(state: TeamLeadState) -> Dict[str, Any]:
     logger.info(
         "[%s] Finalized — status=%s completed=%d/%d",
         project_id, final_status, completed, total,
+    )
+
+    # Record to telemetry store + mem0 memory layer
+    record_teamlead_run(
+        project_id=project_id,
+        report=dict(report),
+        architecture_spec=state.get("architecture_spec", ""),
     )
  
     return {"project_report": report}
