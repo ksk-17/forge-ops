@@ -8,16 +8,23 @@ never imports agents.
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional
 
-from rich.console import Group
+from rich.console import Console, Group
+from rich.live import Live
+from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.prompt import Confirm, Prompt
+from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
+
+from forge_events import EventBus, emit
 
 STATUS_STYLE = {
     "Open": "dim",
@@ -225,3 +232,155 @@ def render_dashboard(state: UIState) -> Group:
         row.add_column(ratio=1)
         row.add_row(_render_tasks(state), _render_workers(state))
         return Group(_render_header(state), row, _render_usage(state), _render_log(state))
+
+
+NO_ANSWER = "(no answer)"  # ArchitectAgent.ask_user drops blank lines; never send one
+
+
+@dataclass
+class _InputRequest:
+    kind: str
+    payload: Dict[str, Any]
+    reply: "queue.Queue[str]" = field(default_factory=queue.Queue)
+
+
+class ForgeUI:
+    def __init__(self, bus: EventBus, console: Optional[Console] = None) -> None:
+        self.console = console or Console()
+        self.state = UIState()
+        self._bus = bus
+        self._plain = not self.console.is_terminal
+        self._requests: "queue.Queue[_InputRequest]" = queue.Queue()
+        self._done = threading.Event()
+        bus.subscribe(self._on_event)
+
+    # -- bus ---------------------------------------------------------------
+    def _on_event(self, event: Dict[str, Any]) -> None:
+        line = self.state.apply(event)
+        if self._plain and line:
+            self.console.print(Text(line))
+
+    # -- called from the pipeline thread -----------------------------------
+    def request_input(self, kind: str, payload: Dict[str, Any]) -> str:
+        emit("prompt_user", agent="ui", metadata={"kind": kind})
+        request = _InputRequest(kind, payload)
+        self._requests.put(request)
+        return request.reply.get()
+
+    # -- main thread -------------------------------------------------------
+    def run(self, pipeline: Callable[[], Any]) -> Any:
+        outcome: Dict[str, Any] = {}
+
+        def target() -> None:
+            try:
+                outcome["value"] = pipeline()
+            except BaseException as exc:  # surfaced on the main thread below
+                outcome["error"] = exc
+            finally:
+                self._done.set()
+
+        thread = threading.Thread(target=target, name="forge-pipeline", daemon=True)
+        live = None if self._plain else Live(
+            render_dashboard(self.state), console=self.console,
+            refresh_per_second=4, transient=True,
+        )
+        thread.start()
+        if live:
+            live.start()
+        try:
+            while not self._done.is_set():
+                try:
+                    request = self._requests.get(timeout=0.25)
+                except queue.Empty:
+                    if live:
+                        live.update(render_dashboard(self.state))
+                    continue
+                if live:
+                    live.stop()
+                request.reply.put(self._prompt(request))
+                if live:
+                    live.start()
+        except KeyboardInterrupt:
+            self.console.print(Text(
+                "Interrupted. Waiting for in-flight workers to finish "
+                "(Ctrl+C again to force quit).", style="yellow"))
+            raise
+        finally:
+            if live:
+                live.stop()
+
+        if "error" in outcome:
+            self.console.print(Panel(Text(f"{type(outcome['error']).__name__}: {outcome['error']}"),
+                                     title="Pipeline failed", border_style="red"))
+            raise outcome["error"]
+        if not self._plain:
+            self.console.print(render_dashboard(self.state))
+        return outcome.get("value")
+
+    # -- prompts -----------------------------------------------------------
+    def _prompt(self, request: _InputRequest) -> str:
+        if request.kind == "questions":
+            return self._ask_questions(request.payload["questions"])
+        if request.kind == "decision":
+            return self._ask_decision(request.payload)
+        raise ValueError(f"unknown input request kind: {request.kind!r}")
+
+    def _ask_questions(self, questions: List[Dict[str, Any]]) -> str:
+        self.console.print(Rule("Clarifying questions"))
+        answers = [self._ask_one(i, q) for i, q in enumerate(questions, 1)]
+        return "\n".join(answers)
+
+    def _ask_one(self, index: int, q: Dict[str, Any]) -> str:
+        self.console.print(Text(f"\nQ{index}. {q['question']}", style="bold"))
+        if q.get("reason"):
+            self.console.print(Text(f"Why: {q['reason']}", style="dim"))
+        qtype, options = q.get("type", "text"), q.get("options") or []
+        if qtype == "yes_no":
+            return "yes" if Confirm.ask("  Answer", console=self.console) else "no"
+        if qtype == "multiple_choice" and options:
+            for n, opt in enumerate(options, 1):
+                self.console.print(Text(f"  {n}. {opt}"))
+            return Prompt.ask("  Answer", console=self.console,
+                              choices=[str(n) for n in range(1, len(options) + 1)])
+        text = " ".join(Prompt.ask("  Answer", console=self.console, default="").split())
+        return text or NO_ANSWER
+
+    def _ask_decision(self, payload: Dict[str, Any]) -> str:
+        self.console.print(Rule("Architect's understanding"))
+        self.console.print(Markdown(payload["understanding"]))
+        answers = payload.get("answers") or []
+        if answers:
+            table = Table(title="Your clarifications", box=None)
+            table.add_column("Question")
+            table.add_column("Answer")
+            for a in answers:
+                table.add_row(Text(a["question"]), Text(a["answer"]))
+            self.console.print(table)
+        choice = Prompt.ask("Do you accept this understanding?", console=self.console,
+                            choices=["accept", "change", "reject"], default="accept")
+        if choice != "change":
+            return choice
+        notes = ""
+        while not notes:
+            notes = " ".join(Prompt.ask("What should change?", console=self.console, default="").split())
+        return f"change: {notes}"
+
+    # -- end of run --------------------------------------------------------
+    def print_summary(self, report: Optional[Dict[str, Any]]) -> None:
+        if report is None:
+            self.console.print(Panel(Text("No project was produced (aborted or rejected)."),
+                                     title="forge", border_style="yellow"))
+            return
+        body = Text()
+        body.append(f"Status: {report['final_status']}\n", style="bold")
+        body.append(f"Tasks: {report['completed_tasks']}/{report['total_tasks']} completed, "
+                    f"{report['failed_tasks']} failed, {report['blocked_tasks']} blocked\n")
+        if report.get("batch_review_scores"):
+            scores = report["batch_review_scores"]
+            body.append(f"Avg batch review: {sum(scores) / len(scores):.1f}/10\n")
+        body.append(f"Tokens: {_fmt_tokens(self.state.input_tokens)} in / "
+                    f"{_fmt_tokens(self.state.output_tokens)} out · est. ${self.state.cost_usd:.4f}\n")
+        for fp in sorted(report.get("all_touched_files", [])):
+            body.append(f"  - {fp}\n")
+        body.append(f"\n{report['summary']}")
+        self.console.print(Panel(body, title=f"Project {report['project_id']}", border_style="green"))
