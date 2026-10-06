@@ -45,3 +45,46 @@ def test_architect_node_is_traced_and_llm_call_attributed(fresh_bus):
 def test_every_architect_node_is_traced():
     for name in ARCHITECT_NODES:
         assert hasattr(getattr(aa, name), "__wrapped__"), name
+
+
+import WorkerAgent as wa
+
+WORKER_NODES = [
+    "plan_task", "execute_task", "review_task", "rework_task",
+    "generate_tests", "report_to_teamlead",
+]
+
+
+def test_every_worker_node_is_traced():
+    for name in WORKER_NODES:
+        assert hasattr(getattr(wa, name), "__wrapped__"), name
+
+
+def test_tool_loop_emits_tool_call_events(fresh_bus):
+    tool_block = SimpleNamespace(
+        type="tool_use", id="t1", name="write_file",
+        input={"file_path": "src/a.py", "project_id": "p"},
+    )
+    first = SimpleNamespace(content=[tool_block], stop_reason="tool_use")
+    done = SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="done")], stop_reason="end_turn",
+    )
+    client = MagicMock()
+    client.messages.create.side_effect = [first, done]
+    with patch.object(wa, "_dispatch_tool", return_value="{}"):
+        wa._run_tool_loop(client, "sys", [{"role": "user", "content": "go"}])
+    tools = [e for e in fresh_bus.history() if e["kind"] == "tool_call"]
+    assert len(tools) == 1
+    assert tools[0]["metadata"] == {"tool": "write_file", "file_path": "src/a.py"}
+
+
+def test_tool_loop_tolerates_non_dict_tool_input(fresh_bus):
+    tool_block = SimpleNamespace(type="tool_use", id="t1", name="read_file", input=None)
+    first = SimpleNamespace(content=[tool_block], stop_reason="tool_use")
+    done = SimpleNamespace(content=[], stop_reason="end_turn")
+    client = MagicMock()
+    client.messages.create.side_effect = [first, done]
+    with patch.object(wa, "_dispatch_tool", return_value="{}"):
+        wa._run_tool_loop(client, "sys", [])
+    tools = [e for e in fresh_bus.history() if e["kind"] == "tool_call"]
+    assert tools[0]["metadata"]["file_path"] is None

@@ -19,6 +19,7 @@ from WorkerTools import (
     write_file,
 )
 from forge_memory import get_worker_context, record_worker_run
+from forge_events import emit, track, traced_node
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +250,11 @@ def _run_tool_loop(
             if block.type != "tool_use":
                 continue
 
+            tool_input = block.input if isinstance(block.input, dict) else {}
+            emit("tool_call", metadata={
+                "tool": block.name,
+                "file_path": tool_input.get("file_path"),
+            })
             tool_result_str = _dispatch_tool(block.name, block.input)
 
             # Track written/created files
@@ -285,9 +291,10 @@ def _parse_review_score(review_text: str) -> int:
     return 0
 
 # Nodes
+@traced_node("worker")
 def plan_task(state: WorkerState) -> Dict[str, Any]:
     task: Task = state["task"]
-    client = Anthropic()
+    client = track(Anthropic(), "worker")
 
     memory_ctx = get_worker_context(task.desc, task.project_id)
 
@@ -352,9 +359,10 @@ def plan_task(state: WorkerState) -> Dict[str, Any]:
     }
 
 
+@traced_node("worker")
 def execute_task(state: WorkerState) -> Dict[str, Any]:
     task: Task = state["task"]
-    client = Anthropic()
+    client = track(Anthropic(), "worker")
 
     system = textwrap.dedent(f"""
         You are a senior software engineer implementing a coding task.
@@ -397,9 +405,10 @@ def execute_task(state: WorkerState) -> Dict[str, Any]:
     }
 
 
+@traced_node("worker")
 def review_task(state: WorkerState) -> Dict[str, Any]:
     task: Task = state["task"]
-    client = Anthropic()
+    client = track(Anthropic(), "worker")
 
     # Read all touched files for the reviewer
     files_content = {}
@@ -487,9 +496,10 @@ def review_task(state: WorkerState) -> Dict[str, Any]:
         ],
     }
 
+@traced_node("worker")
 def rework_task(state: WorkerState) -> Dict[str, Any]:
     task: Task = state["task"]
-    client = Anthropic()
+    client = track(Anthropic(), "worker")
 
     system = textwrap.dedent(f"""
         You are a senior software engineer fixing issues found in a code review.
@@ -546,9 +556,10 @@ def rework_task(state: WorkerState) -> Dict[str, Any]:
         "rework_count": state["rework_count"] + 1,
     }
 
+@traced_node("worker")
 def generate_tests(state: WorkerState) -> Dict[str, Any]:
     task: Task = state["task"]
-    client = Anthropic()
+    client = track(Anthropic(), "worker")
 
     # Gather final file contents for the LLM to test against
     files_content = {}
@@ -639,9 +650,10 @@ def generate_tests(state: WorkerState) -> Dict[str, Any]:
     }
 
 
+@traced_node("worker")
 def report_to_teamlead(state: WorkerState) -> Dict[str, Any]:
     task: Task = state["task"]
-    client = Anthropic()
+    client = track(Anthropic(), "worker")
 
     # Ask the LLM to distil a clean summary and extract structured fields
     system = textwrap.dedent("""
