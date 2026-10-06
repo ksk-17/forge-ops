@@ -185,3 +185,105 @@ def telemetry_subscriber(event: Dict[str, Any]) -> None:
     }
     with _telemetry_lock:  # TelemetryStore appends are not thread-locked
         TelemetryStore.log_event(record)
+
+
+# ── LLM-call tracking ──────────────────────────────────────────────────────
+
+def _as_int(value: Any) -> int:
+    """Token counts must be real ints; anything else (None, MagicMock) is 0."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+class _TrackedMessages:
+    def __init__(self, messages: Any, agent: str) -> None:
+        self._messages = messages
+        self._agent = agent
+
+    def create(self, **kwargs: Any) -> Any:
+        model = kwargs.get("model", "")
+        started = time.monotonic()
+        try:
+            response = self._messages.create(**kwargs)
+        except Exception as exc:
+            emit(
+                "llm_call", agent=self._agent,
+                duration_seconds=time.monotonic() - started,
+                success=False, error=repr(exc),
+                metadata={"model": model, "input_tokens": 0, "output_tokens": 0,
+                          "cost_usd": 0.0, "price_known": False},
+            )
+            raise
+        usage = getattr(response, "usage", None)
+        in_tok = _as_int(getattr(usage, "input_tokens", None))
+        out_tok = _as_int(getattr(usage, "output_tokens", None))
+        cost, known = estimate_cost(model, in_tok, out_tok)
+        emit(
+            "llm_call", agent=self._agent,
+            duration_seconds=time.monotonic() - started,
+            metadata={"model": model, "input_tokens": in_tok, "output_tokens": out_tok,
+                      "cost_usd": cost, "price_known": known},
+        )
+        return response
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._messages, name)
+
+
+class _TrackedClient:
+    def __init__(self, client: Any, agent: str) -> None:
+        self._client = client
+        self.messages = _TrackedMessages(client.messages, agent)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+
+def track(client: Any, agent: str) -> Any:
+    """Wrap an Anthropic client so every messages.create emits an llm_call event."""
+    if isinstance(client, _TrackedClient):
+        return client
+    return _TrackedClient(client, agent)
+
+
+# ── node tracing ───────────────────────────────────────────────────────────
+
+def traced_node(agent: str) -> Callable:
+    """Decorator for LangGraph node functions (state in, update dict out)."""
+    from langgraph.errors import GraphInterrupt
+
+    def decorator(fn: Callable) -> Callable:
+        node = fn.__name__
+
+        @functools.wraps(fn)
+        def wrapper(state: Any, *args: Any, **kwargs: Any) -> Any:
+            fields: Dict[str, Any] = {"agent": agent, "node": node}
+            if isinstance(state, Mapping):
+                if state.get("worker_id"):
+                    fields["worker_id"] = state["worker_id"]
+                task_id = getattr(state.get("task"), "task_id", None)
+                if isinstance(task_id, str):
+                    fields["task_id"] = task_id
+            token = set_context(**fields)
+            started = time.monotonic()
+            emit("node_start")
+            try:
+                result = fn(state, *args, **kwargs)
+            except BaseException as exc:
+                paused = isinstance(exc, GraphInterrupt)
+                emit(
+                    "node_end",
+                    duration_seconds=time.monotonic() - started,
+                    success=paused,
+                    error=None if paused else repr(exc),
+                    metadata={"paused": paused},
+                )
+                raise
+            else:
+                emit("node_end", duration_seconds=time.monotonic() - started)
+                return result
+            finally:
+                reset_context(token)
+
+        return wrapper
+
+    return decorator

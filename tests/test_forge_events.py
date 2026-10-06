@@ -103,3 +103,135 @@ def test_telemetry_subscriber_writes_agent_event_shape(tmp_path, monkeypatch, fr
         "event_id", "run_id", "project_id", "agent", "node", "task_id",
         "duration_seconds", "success", "error", "metadata", "timestamp",
     } <= set(rec)
+
+
+import inspect
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+from langgraph.errors import GraphInterrupt
+
+from forge_events import track, traced_node
+
+
+def _resp(i=10, o=5):
+    return SimpleNamespace(
+        content=[SimpleNamespace(text="hi")],
+        usage=SimpleNamespace(input_tokens=i, output_tokens=o),
+    )
+
+
+def test_track_forwards_call_and_returns_response(fresh_bus):
+    client = MagicMock()
+    client.messages.create.return_value = _resp()
+    result = track(client, "worker").messages.create(
+        model="claude-haiku-4-5", max_tokens=5, messages=[]
+    )
+    assert result is client.messages.create.return_value
+    client.messages.create.assert_called_once_with(
+        model="claude-haiku-4-5", max_tokens=5, messages=[]
+    )
+
+
+def test_track_emits_tokens_and_cost(fresh_bus):
+    client = MagicMock()
+    client.messages.create.return_value = _resp(10, 5)
+    track(client, "worker").messages.create(model="claude-haiku-4-5")
+    e = fresh_bus.history()[-1]
+    assert e["kind"] == "llm_call" and e["agent"] == "worker"
+    md = e["metadata"]
+    assert (md["input_tokens"], md["output_tokens"]) == (10, 5)
+    assert md["cost_usd"] == pytest.approx((10 * 1.0 + 5 * 5.0) / 1_000_000)
+    assert md["price_known"] is True and e["duration_seconds"] >= 0
+
+
+@pytest.mark.parametrize("response", [
+    SimpleNamespace(content=[]),                      # no usage attribute
+    SimpleNamespace(content=[], usage=None),          # usage is None
+    MagicMock(),                                      # usage is a MagicMock
+])
+def test_track_tolerates_missing_or_mock_usage(fresh_bus, response):
+    client = MagicMock()
+    client.messages.create.return_value = response
+    out = track(client, "a").messages.create(model="claude-haiku-4-5")
+    assert out is response
+    md = fresh_bus.history()[-1]["metadata"]
+    assert (md["input_tokens"], md["output_tokens"], md["cost_usd"]) == (0, 0, 0.0)
+
+
+def test_track_records_failure_and_reraises(fresh_bus):
+    client = MagicMock()
+    client.messages.create.side_effect = RuntimeError("api down")
+    with pytest.raises(RuntimeError):
+        track(client, "a").messages.create(model="claude-haiku-4-5")
+    e = fresh_bus.history()[-1]
+    assert e["kind"] == "llm_call" and e["success"] is False and "api down" in e["error"]
+
+
+def test_track_proxies_other_attributes_and_does_not_double_wrap(fresh_bus):
+    client = MagicMock()
+    tracked = track(client, "a")
+    assert tracked.models is client.models
+    assert track(tracked, "a") is tracked
+
+
+def test_traced_node_emits_start_end_and_returns_value(fresh_bus):
+    @traced_node("worker")
+    def plan_task(state):
+        return {"plan": "x"}
+
+    state = {"worker_id": "worker-a", "task": SimpleNamespace(task_id="a")}
+    assert plan_task(state) == {"plan": "x"}
+    rows = [(e["kind"], e["node"], e["worker_id"], e["task_id"]) for e in fresh_bus.history()]
+    assert rows == [
+        ("node_start", "plan_task", "worker-a", "a"),
+        ("node_end", "plan_task", "worker-a", "a"),
+    ]
+    assert fresh_bus.history()[-1]["success"] is True
+
+
+def test_traced_node_attributes_llm_calls_to_node_and_worker(fresh_bus):
+    client = MagicMock()
+    client.messages.create.return_value = _resp()
+
+    @traced_node("worker")
+    def execute_task(state):
+        track(client, "worker").messages.create(model="claude-haiku-4-5")
+        return {}
+
+    execute_task({"worker_id": "worker-a", "task": SimpleNamespace(task_id="a")})
+    call = next(e for e in fresh_bus.history() if e["kind"] == "llm_call")
+    assert (call["node"], call["worker_id"], call["task_id"]) == ("execute_task", "worker-a", "a")
+
+
+def test_traced_node_records_failure_and_reraises(fresh_bus):
+    @traced_node("teamlead")
+    def boom(state):
+        raise ValueError("nope")
+
+    with pytest.raises(ValueError):
+        boom({})
+    end = fresh_bus.history()[-1]
+    assert end["kind"] == "node_end" and end["success"] is False and "nope" in end["error"]
+
+
+def test_traced_node_treats_graph_interrupt_as_pause(fresh_bus):
+    @traced_node("architect")
+    def ask_user(state):
+        raise GraphInterrupt()
+
+    with pytest.raises(GraphInterrupt):
+        ask_user({})
+    end = fresh_bus.history()[-1]
+    assert end["success"] is True and end["metadata"]["paused"] is True
+
+
+def test_traced_node_preserves_signature_and_resets_context(fresh_bus):
+    @traced_node("worker")
+    def plan_task(state):
+        return {}
+
+    assert plan_task.__name__ == "plan_task"
+    assert list(inspect.signature(plan_task).parameters) == ["state"]
+    plan_task({"worker_id": "worker-a"})
+    assert emit("llm_call")["worker_id"] is None
