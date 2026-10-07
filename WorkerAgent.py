@@ -18,6 +18,8 @@ from WorkerTools import (
     create_file,
     write_file,
 )
+from forge_memory import get_worker_context, record_worker_run
+from forge_events import emit, track, traced_node
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +250,11 @@ def _run_tool_loop(
             if block.type != "tool_use":
                 continue
 
+            tool_input = block.input if isinstance(block.input, dict) else {}
+            emit("tool_call", metadata={
+                "tool": block.name,
+                "file_path": tool_input.get("file_path"),
+            })
             tool_result_str = _dispatch_tool(block.name, block.input)
 
             # Track written/created files
@@ -284,9 +291,12 @@ def _parse_review_score(review_text: str) -> int:
     return 0
 
 # Nodes
+@traced_node("worker")
 def plan_task(state: WorkerState) -> Dict[str, Any]:
     task: Task = state["task"]
-    client = Anthropic()
+    client = track(Anthropic(), "worker")
+
+    memory_ctx = get_worker_context(task.desc, task.project_id)
 
     # Read project schema for context
     try:
@@ -295,10 +305,14 @@ def plan_task(state: WorkerState) -> Dict[str, Any]:
     except Exception as exc:
         schema_summary = f"(Could not load project schema: {exc})"
 
+    # Prepend any relevant memory context so the planner benefits from
+    # past implementations in this project and agent-level patterns.
+    memory_section = f"\n{memory_ctx}\n" if memory_ctx else ""
+
     system = textwrap.dedent(f"""
         You are a senior software engineer planning implementation of a coding task.
         You have full context of the project schema below.
-
+        {memory_section}
         Your job: produce a clear, numbered implementation plan.
         - List every file you will create or modify (with the relative path).
         - For each file, describe exactly what functions/classes/changes are needed.
@@ -345,9 +359,10 @@ def plan_task(state: WorkerState) -> Dict[str, Any]:
     }
 
 
+@traced_node("worker")
 def execute_task(state: WorkerState) -> Dict[str, Any]:
     task: Task = state["task"]
-    client = Anthropic()
+    client = track(Anthropic(), "worker")
 
     system = textwrap.dedent(f"""
         You are a senior software engineer implementing a coding task.
@@ -390,9 +405,10 @@ def execute_task(state: WorkerState) -> Dict[str, Any]:
     }
 
 
+@traced_node("worker")
 def review_task(state: WorkerState) -> Dict[str, Any]:
     task: Task = state["task"]
-    client = Anthropic()
+    client = track(Anthropic(), "worker")
 
     # Read all touched files for the reviewer
     files_content = {}
@@ -480,9 +496,10 @@ def review_task(state: WorkerState) -> Dict[str, Any]:
         ],
     }
 
+@traced_node("worker")
 def rework_task(state: WorkerState) -> Dict[str, Any]:
     task: Task = state["task"]
-    client = Anthropic()
+    client = track(Anthropic(), "worker")
 
     system = textwrap.dedent(f"""
         You are a senior software engineer fixing issues found in a code review.
@@ -539,9 +556,10 @@ def rework_task(state: WorkerState) -> Dict[str, Any]:
         "rework_count": state["rework_count"] + 1,
     }
 
+@traced_node("worker")
 def generate_tests(state: WorkerState) -> Dict[str, Any]:
     task: Task = state["task"]
-    client = Anthropic()
+    client = track(Anthropic(), "worker")
 
     # Gather final file contents for the LLM to test against
     files_content = {}
@@ -632,9 +650,10 @@ def generate_tests(state: WorkerState) -> Dict[str, Any]:
     }
 
 
+@traced_node("worker")
 def report_to_teamlead(state: WorkerState) -> Dict[str, Any]:
     task: Task = state["task"]
-    client = Anthropic()
+    client = track(Anthropic(), "worker")
 
     # Ask the LLM to distil a clean summary and extract structured fields
     system = textwrap.dedent("""
@@ -716,6 +735,13 @@ def report_to_teamlead(state: WorkerState) -> Dict[str, Any]:
     logger.info(
         "[%s] Report ready — status=%s score=%d/10 blockers=%d",
         task.task_id, status, score, len(blockers),
+    )
+
+    # Record to telemetry store + mem0 memory layer
+    record_worker_run(
+        task_id=task.task_id,
+        project_id=task.project_id,
+        report=dict(report),
     )
 
     return {"report": report}

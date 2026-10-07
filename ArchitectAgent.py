@@ -4,7 +4,7 @@ import json
 import logging
 import textwrap
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 import sys, select, os
 
 from anthropic import Anthropic
@@ -13,10 +13,12 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt, Command
 from typing_extensions import TypedDict
 from models import ArchitectureSpec, Question, RequirementsReview, UserAnswer
+from forge_memory import get_architect_context, record_architect_run
+from forge_events import track, traced_node
 
 logger = logging.getLogger(__name__)
 
-MODEL = "claude-opus-4-5"
+MODEL = "claude-haiku-4-5"
 MAX_CLARIFICATION_ROUNDS = 4
 COMPLETENESS_THRESHOLD = 8
 MAX_QUESTIONS_PER_ROUND = 3
@@ -36,7 +38,7 @@ class ArchitectState(TypedDict):
 # Helpers
 
 def _llm(system: str, user: str, max_tokens: int = 2048) -> str:
-    client = Anthropic()
+    client = track(Anthropic(), "architect")
     response = client.messages.create(
         model=MODEL,
         max_tokens=max_tokens,
@@ -134,11 +136,16 @@ def _render_understanding(understanding: str, answers: List[UserAnswer]) -> str:
 
 # Graph nodes
 
+@traced_node("architect")
 def analyse_input(state: ArchitectState) -> Dict[str, Any]:
-    system = textwrap.dedent("""
+    memory_ctx = get_architect_context(state['raw_input'])
+
+    memory_section = f"\n{memory_ctx}\n" if memory_ctx else ""
+
+    system = textwrap.dedent(f"""
         You are a senior software architect turning a client's rough idea into a
         structured understanding.
-
+        {memory_section}
         Read their description and produce a document with these sections:
 
         ## What is clear
@@ -176,6 +183,7 @@ def analyse_input(state: ArchitectState) -> Dict[str, Any]:
     }
 
 
+@traced_node("architect")
 def generate_questions(state: ArchitectState) -> Dict[str, Any]:
     answered_ids = {a["question_id"] for a in state.get("answers", [])}
     prev_answers_block = ""
@@ -236,6 +244,7 @@ def generate_questions(state: ArchitectState) -> Dict[str, Any]:
     return {"questions": questions}
 
 
+@traced_node("architect")
 def ask_user(state: ArchitectState) -> Dict[str, Any]:
     questions = state.get("questions", [])
     if not questions:
@@ -279,6 +288,7 @@ def ask_user(state: ArchitectState) -> Dict[str, Any]:
     return {"answers": all_answers, "human_input": ""}
 
 
+@traced_node("architect")
 def incorporate_answers(state: ArchitectState) -> Dict[str, Any]:
     answers_block = "\n".join(
         f"Q: {a['question']}\nA: {a['answer']}"
@@ -316,6 +326,7 @@ def incorporate_answers(state: ArchitectState) -> Dict[str, Any]:
     }
 
 
+@traced_node("architect")
 def check_completeness(state: ArchitectState) -> Dict[str, Any]:
     system = textwrap.dedent("""
         You are a senior architect deciding whether requirements are complete
@@ -359,6 +370,7 @@ def check_completeness(state: ArchitectState) -> Dict[str, Any]:
     return {"completeness_score": score}
 
 
+@traced_node("architect")
 def present_summary(state: ArchitectState) -> Dict[str, Any]:
     display = _render_understanding(
         state["understanding"],
@@ -386,6 +398,7 @@ def present_summary(state: ArchitectState) -> Dict[str, Any]:
     return {"user_review": review, "human_input": ""}
 
 
+@traced_node("architect")
 def handle_user_review(state: ArchitectState) -> Dict[str, Any]:
     review = state.get("user_review") or {}
     if review.get("decision") == "change" and review.get("change_notes"):
@@ -403,6 +416,7 @@ def handle_user_review(state: ArchitectState) -> Dict[str, Any]:
     return {}
 
 
+@traced_node("architect")
 def produce_architecture_spec(state: ArchitectState) -> Dict[str, Any]:
     # Extract project name from understanding
     project_name = state["project_id"]
@@ -483,6 +497,14 @@ def produce_architecture_spec(state: ArchitectState) -> Dict[str, Any]:
     logger.info(
         "[%s] produce_architecture_spec: spec ready (%d chars)",
         state["project_id"], len(spec_text),
+    )
+
+    # Record to telemetry store + mem0 memory layer
+    record_architect_run(
+        project_id=state["project_id"],
+        spec=dict(spec),
+        answers=state.get("answers", []),
+        raw_input=state.get("raw_input", ""),
     )
 
     return {"architecture_spec": spec}
@@ -642,11 +664,8 @@ def _extract_interrupt(event: dict) -> str:
     return str(first)
 
 
-def run_architect_cli(project_id: str, raw_input: str) -> Optional[ArchitectureSpec]:
-    agent = create_architect_agent()
-    config = {"configurable": {"thread_id": project_id}}
-
-    initial_state: ArchitectState = {
+def _initial_architect_state(project_id: str, raw_input: str) -> ArchitectState:
+    return {
         "project_id": project_id,
         "raw_input": raw_input,
         "understanding": "",
@@ -658,6 +677,46 @@ def run_architect_cli(project_id: str, raw_input: str) -> Optional[ArchitectureS
         "user_review": None,
         "architecture_spec": None,
     }
+
+
+def run_architect(
+    project_id: str,
+    raw_input: str,
+    ask_questions: Callable[[List[Question]], str],
+    ask_decision: Callable[[Dict[str, Any]], str],
+) -> Optional[ArchitectureSpec]:
+    """Drive the Architect graph, delegating human input to the callbacks."""
+    agent = create_architect_agent()
+    config = {"configurable": {"thread_id": project_id}}
+    input_val: Any = _initial_architect_state(project_id, raw_input)
+
+    while True:
+        interrupted = False
+        for event in agent.stream(input_val, config, stream_mode="updates"):
+            if _extract_interrupt(event):
+                interrupted = True
+                break
+        if not interrupted:
+            break
+
+        state = agent.get_state(config)
+        next_node = state.next[0] if state.next else ""
+        if next_node == "ask_user":
+            reply = ask_questions(state.values.get("questions", []))
+        elif next_node == "present_summary":
+            reply = ask_decision(state.values)
+        else:
+            raise RuntimeError(f"Unexpected Architect interrupt at node {next_node!r}")
+        input_val = Command(resume=reply)
+
+    return agent.get_state(config).values.get("architecture_spec")
+
+
+def run_architect_cli(project_id: str, raw_input: str) -> Optional[ArchitectureSpec]:
+    agent = create_architect_agent()
+    config = {"configurable": {"thread_id": project_id}}
+
+    initial_state = _initial_architect_state(project_id, raw_input)
 
     input_val: Any = initial_state
 
